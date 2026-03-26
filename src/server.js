@@ -11,12 +11,24 @@ import {
   CALL_OUTCOMES,
   CHATBOT_POSITIONS,
   PLAN_LIMITS,
+  VOICE_AGENT_DIRECTIONS,
   createChatbot,
   createDefaultState,
   createVoiceAgent,
   normalizeWorkspaceState,
 } from "./defaults.js";
 import { createStore } from "./store.js";
+import {
+  buildTwimlResponse,
+  createTwilioCall,
+  resolveTwilioConfig,
+  twimlDial,
+  twimlGather,
+  twimlHangup,
+  twimlPause,
+  twimlSay,
+  validateTwilioSignature,
+} from "./twilio.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -41,6 +53,11 @@ const PUBLIC_ROUTES = new Set([
   "POST /api/public/chatbots/:id/messages",
   "POST /api/contact",
   "POST /api/contact-sales",
+  "POST /api/twilio/voice/:id/inbound",
+  "POST /api/twilio/voice/:id/continue",
+  "POST /api/twilio/voice/:id/outbound/:sessionId/twiml",
+  "POST /api/twilio/voice/:id/outbound/:sessionId/continue",
+  "POST /api/twilio/voice/status",
 ]);
 
 const ROUTE_DOCS = [
@@ -68,6 +85,7 @@ const ROUTE_DOCS = [
   { method: "PATCH", path: "/api/voice-agents/:id", auth: true, description: "Update a specific voice agent." },
   { method: "DELETE", path: "/api/voice-agents/:id", auth: true, description: "Delete a non-last voice agent." },
   { method: "POST", path: "/api/voice-agents/:id/activate", auth: true, description: "Set the active voice agent used across the workspace." },
+  { method: "POST", path: "/api/voice-agents/:id/outbound-calls", auth: true, description: "Launch a real outbound Twilio call from a configured outbound voice agent." },
   { method: "GET", path: "/api/agent", auth: true, description: "Return the current agent configuration." },
   { method: "PATCH", path: "/api/agent", auth: true, description: "Update agent configuration and nested rules." },
   { method: "GET", path: "/api/agent/faqs", auth: true, description: "Return the agent FAQ list." },
@@ -109,6 +127,11 @@ const ROUTE_DOCS = [
   { method: "GET", path: "/api/billing/invoices/:id/download", auth: true, description: "Download a plain-text invoice receipt." },
   { method: "POST", path: "/api/contact", auth: false, description: "Submit a public contact form message." },
   { method: "POST", path: "/api/contact-sales", auth: false, description: "Submit a pricing or enterprise sales inquiry." },
+  { method: "POST", path: "/api/twilio/voice/:id/inbound", auth: false, description: "Twilio inbound voice webhook that starts a live inbound agent conversation." },
+  { method: "POST", path: "/api/twilio/voice/:id/continue", auth: false, description: "Twilio Gather callback that continues an inbound voice-agent conversation." },
+  { method: "POST", path: "/api/twilio/voice/:id/outbound/:sessionId/twiml", auth: false, description: "Twilio webhook that serves outbound call instructions for a launched voice agent call." },
+  { method: "POST", path: "/api/twilio/voice/:id/outbound/:sessionId/continue", auth: false, description: "Twilio Gather callback that continues an outbound voice-agent conversation." },
+  { method: "POST", path: "/api/twilio/voice/status", auth: false, description: "Twilio status callback for inbound and outbound call lifecycle updates." },
 ];
 
 const KNOWN_ROUTE_KEYS = new Set(ROUTE_DOCS.map((entry) => `${entry.method} ${entry.path}`));
@@ -151,6 +174,14 @@ const sendText = (res, statusCode, text, headers = {}) => {
   res.end(text);
 };
 
+const sendXml = (res, statusCode, xml) => {
+  setCorsHeaders(res);
+  res.writeHead(statusCode, {
+    "Content-Type": "text/xml; charset=utf-8",
+  });
+  res.end(xml);
+};
+
 const sendScript = (res, statusCode, script) => {
   setCorsHeaders(res);
   res.writeHead(statusCode, {
@@ -168,7 +199,7 @@ const sendCsv = (res, filename, content) => {
   res.end(content);
 };
 
-const readJsonBody = async (req) => {
+const readRequestBody = async (req) => {
   const chunks = [];
 
   for await (const chunk of req) {
@@ -184,11 +215,34 @@ const readJsonBody = async (req) => {
     return {};
   }
 
-  try {
-    return JSON.parse(raw);
-  } catch (error) {
-    throw new HttpError(400, "Request body must be valid JSON.");
+  const contentType = String(req.headers["content-type"] || "").toLowerCase();
+  if (contentType.includes("application/x-www-form-urlencoded")) {
+    const searchParams = new URLSearchParams(raw);
+    const parsed = {};
+
+    for (const [key, value] of searchParams) {
+      if (Object.prototype.hasOwnProperty.call(parsed, key)) {
+        const previousValue = parsed[key];
+        parsed[key] = Array.isArray(previousValue) ? [...previousValue, value] : [previousValue, value];
+      } else {
+        parsed[key] = value;
+      }
+    }
+
+    return parsed;
   }
+
+  if (contentType.includes("application/json") || !contentType) {
+    try {
+      return JSON.parse(raw);
+    } catch (error) {
+      throw new HttpError(400, "Request body must be valid JSON.");
+    }
+  }
+
+  return {
+    raw,
+  };
 };
 
 const parseBearerToken = (req) => {
@@ -344,6 +398,36 @@ const getPublicBaseUrl = (req) => {
   return `${protocol}://${host}`;
 };
 
+const getWorkspaceTwilioConfig = (req, settings = {}, twilioRuntimeConfig = {}) => {
+  const workspaceTwilio = settings?.twilio || {};
+  return {
+    accountSid: workspaceTwilio.accountSid || twilioRuntimeConfig.accountSid || "",
+    authToken: workspaceTwilio.authToken || twilioRuntimeConfig.authToken || "",
+    validateRequests: workspaceTwilio.validateRequests ?? twilioRuntimeConfig.validateRequests ?? true,
+    webhookBaseUrl: twilioRuntimeConfig.webhookBaseUrl || getPublicBaseUrl(req),
+    fetchImpl: twilioRuntimeConfig.fetchImpl,
+  };
+};
+
+const serializeTwilioSettings = (req, settings = {}, twilioRuntimeConfig = {}) => {
+  const workspaceTwilio = settings?.twilio || {};
+  const authToken = workspaceTwilio.authToken || "";
+
+  return {
+    accountSid: workspaceTwilio.accountSid || "",
+    authTokenConfigured: Boolean(authToken),
+    authTokenLastFour: authToken ? authToken.slice(-4) : "",
+    validateRequests: workspaceTwilio.validateRequests ?? true,
+    webhookBaseUrl: getWorkspaceTwilioConfig(req, settings, twilioRuntimeConfig).webhookBaseUrl,
+  };
+};
+
+const serializeSettings = (req, settings = {}, twilioRuntimeConfig = {}) => ({
+  timezone: settings?.timezone || "America/New_York",
+  phoneNumber: settings?.phoneNumber || "",
+  twilio: serializeTwilioSettings(req, settings, twilioRuntimeConfig),
+});
+
 const findCallById = (state, id) => state.calls.find((call) => call.id === id) || null;
 const findLeadById = (state, id) => state.leads.find((lead) => lead.id === id) || null;
 const findInvoiceById = (state, id) => state.organization.invoices.find((invoice) => invoice.id === id) || null;
@@ -374,8 +458,9 @@ const serializeChatbot = (req, chatbot) => ({
   widgetScriptUrl: `${getPublicBaseUrl(req)}/embed/chatbot.js`,
 });
 
-const serializeOrganization = (req, organization) => ({
+const serializeOrganization = (req, organization, twilioRuntimeConfig) => ({
   ...organization,
+  settings: serializeSettings(req, organization.settings, twilioRuntimeConfig),
   chatbots: organization.chatbots.map((chatbot) => serializeChatbot(req, chatbot)),
 });
 
@@ -386,6 +471,8 @@ const buildVoiceAgentTemplate = (state) => {
     ...current,
     id: uniqueId("voice_agent"),
     name: `Voice Agent ${index}`,
+    twilioPhoneNumber: "",
+    twilioPhoneSid: "",
     greeting: `Hello, thank you for calling ${state.organization.profile.name}. This is Voice Agent ${index}. How can I help you today?`,
     faqs: current.faqs.map((faq) => ({ ...faq, id: uniqueId("faq") })),
   });
@@ -398,6 +485,7 @@ const buildChatbotTemplate = (state) => {
     id: uniqueId("chatbot"),
     voiceAgentId: activeAgent.id,
     name: `Chatbot ${index}`,
+    faqs: activeAgent.faqs.map((faq) => ({ ...faq, id: uniqueId("faq") })),
     headerTitle: `${state.organization.profile.name} Assistant`,
     welcomeMessage: `Hi! I'm ${activeAgent.name}'s website assistant for ${state.organization.profile.name}. Ask me anything and I can guide you from here.`,
     launcherLabel: "Need help?",
@@ -499,6 +587,7 @@ const buildOutcomeBreakdown = (calls) => {
 };
 
 const buildDashboard = (state) => {
+  const activeVoiceAgent = getActiveVoiceAgent(state);
   const averageDurationMinutes = state.calls.length > 0
     ? state.calls.reduce((total, call) => total + call.duration, 0) / state.calls.length / 60
     : 0;
@@ -517,8 +606,9 @@ const buildDashboard = (state) => {
     usage: state.organization.subscription.usage,
     agentStatus: {
       online: true,
-      agentName: state.organization.agent.name,
-      phoneNumber: state.organization.phoneNumber,
+      agentName: activeVoiceAgent.name,
+      phoneNumber: activeVoiceAgent.twilioPhoneNumber || state.organization.phoneNumber,
+      direction: activeVoiceAgent.direction,
     },
   };
 };
@@ -708,6 +798,299 @@ const buildCallFromSimulation = ({ transcript, callerName, callerPhone, duration
   };
 };
 
+const TWILIO_SPEECH_LANGUAGE_BY_AGENT_LANGUAGE = {
+  English: "en-US",
+  Spanish: "es-ES",
+  French: "fr-FR",
+  German: "de-DE",
+};
+
+const CALL_OUTCOME_PRIORITY = {
+  [CALL_OUTCOMES.FAQ_ANSWERED]: 1,
+  [CALL_OUTCOMES.VOICEMAIL]: 2,
+  [CALL_OUTCOMES.LEAD_CAPTURED]: 3,
+  [CALL_OUTCOMES.APPOINTMENT_BOOKED]: 4,
+  [CALL_OUTCOMES.ESCALATED]: 5,
+};
+
+const getTwilioBaseUrl = (req, twilioConfig) => twilioConfig.webhookBaseUrl || getPublicBaseUrl(req);
+
+const buildTwilioWebhookUrl = (req, twilioConfig, pathname, searchParams = null) => {
+  const query = searchParams instanceof URLSearchParams && [...searchParams.keys()].length > 0
+    ? `?${searchParams.toString()}`
+    : "";
+  return `${getTwilioBaseUrl(req, twilioConfig)}${pathname}${query}`;
+};
+
+const requireTwilioRequestValidation = (req, url, body, twilioConfig) => {
+  if (twilioConfig.validateRequests === false) {
+    return;
+  }
+
+  if (!twilioConfig.authToken) {
+    throw new HttpError(500, "Twilio webhook validation requires TWILIO_AUTH_TOKEN. Set it or disable validation with TWILIO_VALIDATE_REQUESTS=false.");
+  }
+
+  const signature = req.headers["x-twilio-signature"];
+  if (!signature) {
+    throw new HttpError(403, "Missing X-Twilio-Signature header.");
+  }
+
+  const requestUrl = `${getTwilioBaseUrl(req, twilioConfig)}${url.pathname}${url.search}`;
+  const isValid = validateTwilioSignature({
+    authToken: twilioConfig.authToken,
+    signature,
+    requestUrl,
+    params: body,
+  });
+
+  if (!isValid) {
+    throw new HttpError(403, "Twilio request signature is invalid.");
+  }
+};
+
+const getTwilioActiveCall = (state, callSid) => state.twilio?.activeCalls?.[callSid] || null;
+
+const getPendingTwilioOutboundCall = (state, sessionId) => state.twilio?.pendingOutboundCalls?.[sessionId] || null;
+
+const ensureTwilioState = (state) => {
+  state.twilio = state.twilio || {};
+  state.twilio.activeCalls = state.twilio.activeCalls || {};
+  state.twilio.pendingOutboundCalls = state.twilio.pendingOutboundCalls || {};
+};
+
+const mergeCallOutcome = (currentOutcome, nextOutcome) => {
+  if (!nextOutcome) {
+    return currentOutcome;
+  }
+
+  const currentPriority = CALL_OUTCOME_PRIORITY[currentOutcome] || 0;
+  const nextPriority = CALL_OUTCOME_PRIORITY[nextOutcome] || 0;
+  return nextPriority >= currentPriority ? nextOutcome : currentOutcome;
+};
+
+const mergeLeadDetails = (currentLead = {}, nextLead = {}) => ({
+  name: nextLead.name || currentLead.name || "",
+  email: nextLead.email || currentLead.email || "",
+  phone: nextLead.phone || currentLead.phone || "",
+  reason: nextLead.reason || currentLead.reason || "",
+});
+
+const appendTranscriptLine = (session, speaker, text) => {
+  const normalizedText = String(text || "").trim();
+  if (!normalizedText) {
+    return;
+  }
+
+  session.transcript.push({
+    speaker,
+    text: normalizedText,
+  });
+};
+
+const buildVoiceKnowledgeResponse = (message, state, agent) => {
+  const normalized = message.toLowerCase();
+
+  for (const faq of agent.faqs) {
+    const questionWords = faq.question.toLowerCase().split(/[^a-z0-9]+/).filter((word) => word.length > 3);
+    if (questionWords.some((word) => normalized.includes(word))) {
+      return faq.answer;
+    }
+  }
+
+  if (normalized.includes("hour")) {
+    return `We are available during ${agent.businessHours}.`;
+  }
+
+  if (normalized.includes("where") || normalized.includes("location")) {
+    return `We are based in ${state.organization.profile.location}.`;
+  }
+
+  return null;
+};
+
+const buildVoiceFallbackResponse = (agent) => {
+  const toneFallbacks = {
+    Professional: "I can help with that. Please share a little more detail and I will capture it for the team.",
+    Friendly: "Happy to help. Tell me a little more and I will make sure the team gets what they need.",
+    Empathetic: "I'm here to help. Share a few more details and I will make sure your request is handled with care.",
+  };
+
+  return toneFallbacks[agent.tone] || toneFallbacks.Professional;
+};
+
+const buildVoiceTurn = ({ message, state, agent, session }) => {
+  const normalized = String(message || "").toLowerCase();
+  const leadDetails = extractLeadDetails(message, {
+    ...session.lead,
+    phone: session.lead.phone || session.customerPhone || "",
+    name: session.lead.name || session.customerName || "",
+  });
+
+  const requestedTransfer = normalized.includes("human") || normalized.includes("person") || normalized.includes("transfer");
+  if (requestedTransfer) {
+    return {
+      responseText: agent.rules.autoEscalate && agent.escalationPhone
+        ? `I'm connecting you to our team at ${agent.escalationPhone} now.`
+        : "I've captured your request for a human follow-up and our team will call you back.",
+      leadDetails,
+      outcome: CALL_OUTCOMES.ESCALATED,
+      shouldCaptureLead: true,
+      shouldDial: Boolean(agent.rules.autoEscalate && agent.escalationPhone),
+      shouldContinue: false,
+    };
+  }
+
+  const requestedAppointment = normalized.includes("appointment") || normalized.includes("schedule") || normalized.includes("book");
+  if (requestedAppointment) {
+    return {
+      responseText: agent.rules.autoBook
+        ? `I've captured your appointment request and our team will follow up at ${leadDetails.phone || session.customerPhone || "the number on file"}.`
+        : "I've captured your appointment request and the team will review it for a callback.",
+      leadDetails,
+      outcome: CALL_OUTCOMES.APPOINTMENT_BOOKED,
+      shouldCaptureLead: true,
+      shouldDial: false,
+      shouldContinue: false,
+    };
+  }
+
+  const wantsFollowUp = normalized.includes("call me") || normalized.includes("contact me") || normalized.includes("my number is") || normalized.includes("email me");
+  if (wantsFollowUp) {
+    return {
+      responseText: `Thanks. I've captured your details and our team will follow up at ${leadDetails.phone || session.customerPhone || "the number you provided"}.`,
+      leadDetails,
+      outcome: CALL_OUTCOMES.LEAD_CAPTURED,
+      shouldCaptureLead: true,
+      shouldDial: false,
+      shouldContinue: false,
+    };
+  }
+
+  const knowledgeResponse = buildVoiceKnowledgeResponse(message, state, agent);
+  return {
+    responseText: knowledgeResponse || buildVoiceFallbackResponse(agent),
+    leadDetails,
+    outcome: knowledgeResponse ? CALL_OUTCOMES.FAQ_ANSWERED : inferCallOutcome(message),
+    shouldCaptureLead: false,
+    shouldDial: false,
+    shouldContinue: session.turnCount < 2,
+  };
+};
+
+const createTwilioSession = ({
+  agent,
+  direction,
+  callSid,
+  customerPhone,
+  customerName,
+  prompt = "",
+  outboundSessionId = "",
+}) => ({
+  callSid,
+  agentId: agent.id,
+  agentName: agent.name,
+  direction,
+  customerPhone: customerPhone || "",
+  customerName: customerName || "",
+  prompt,
+  status: "started",
+  startedAt: nowIso(),
+  updatedAt: nowIso(),
+  turnCount: 0,
+  transcript: [],
+  lead: {
+    name: customerName || "",
+    email: "",
+    phone: customerPhone || "",
+    reason: "",
+  },
+  shouldCaptureLead: false,
+  outcome: CALL_OUTCOMES.FAQ_ANSWERED,
+  answeredBy: "",
+  callRecordId: "",
+  outboundSessionId,
+  twilioStatusHistory: [],
+});
+
+const buildGatherActionAttributes = (req, twilioConfig, actionPath, agent) => ({
+  input: "speech dtmf",
+  method: "POST",
+  action: buildTwilioWebhookUrl(req, twilioConfig, actionPath),
+  timeout: "4",
+  speechTimeout: "auto",
+  language: TWILIO_SPEECH_LANGUAGE_BY_AGENT_LANGUAGE[agent.language] || "en-US",
+});
+
+const buildCallRecordFromSession = (session, fallbackStatus = "") => {
+  const outcome = session.outcome
+    || (["busy", "failed", "no-answer", "canceled"].includes(fallbackStatus) ? CALL_OUTCOMES.VOICEMAIL : CALL_OUTCOMES.FAQ_ANSWERED);
+  const transcript = session.transcript.length > 0
+    ? session.transcript
+    : [
+      {
+        speaker: "Agent",
+        text: session.direction === "outbound"
+          ? `Outbound call attempt to ${session.customerPhone || "unknown number"}.`
+          : "Incoming call connected to the voice agent.",
+      },
+    ];
+  const transcriptText = transcript.map((line) => `${line.speaker}: ${line.text}`).join("\n");
+  const summary = summarizeTranscript(transcriptText, outcome, session.lead);
+
+  return {
+    id: uniqueId("call"),
+    callerName: session.customerName || session.lead.name || "Unknown",
+    callerPhone: session.customerPhone || session.lead.phone || "Unknown",
+    duration: Number(session.duration || 0),
+    timestamp: session.startedAt || nowIso(),
+    outcome,
+    summary,
+    transcript,
+  };
+};
+
+const finalizeTwilioCallSession = (draft, session, statusPayload = {}) => {
+  if (session.callRecordId) {
+    return {
+      call: draft.calls.find((entry) => entry.id === session.callRecordId) || null,
+      lead: null,
+    };
+  }
+
+  const call = buildCallRecordFromSession(session, statusPayload.callStatus);
+  draft.calls.unshift(call);
+  session.callRecordId = call.id;
+
+  let lead = null;
+  if (session.shouldCaptureLead && (session.lead.name || session.lead.phone || session.lead.email)) {
+    lead = buildLeadFromDetails(session.lead, call.timestamp);
+    if (lead) {
+      draft.leads.unshift(lead);
+    }
+  }
+
+  const additionalMinutes = Math.max(1, Math.ceil((call.duration || 1) / 60));
+  draft.organization.subscription.usage.calls = Math.min(
+    draft.organization.subscription.usage.callLimit,
+    draft.organization.subscription.usage.calls + 1
+  );
+  draft.organization.subscription.usage.minutes = Math.min(
+    draft.organization.subscription.usage.minuteLimit,
+    draft.organization.subscription.usage.minutes + additionalMinutes
+  );
+
+  delete draft.twilio.activeCalls[session.callSid];
+  if (session.outboundSessionId) {
+    delete draft.twilio.pendingOutboundCalls[session.outboundSessionId];
+  }
+
+  return {
+    call,
+    lead,
+  };
+};
+
 const getConversation = (state, chatbotId = state.organization.activeChatbotId) => {
   const chatbot = findChatbotById(state, chatbotId) || getActiveChatbot(state);
   const greeting = {
@@ -727,6 +1110,20 @@ const findFaqResponse = (message, state, chatbotId = state.organization.activeCh
   const chatbot = findChatbotById(state, chatbotId) || getActiveChatbot(state);
   const agent = getVoiceAgentForChatbot(state, chatbot);
 
+  for (const faq of chatbot.faqs) {
+    const questionWords = faq.question.toLowerCase().split(/[^a-z0-9]+/).filter((word) => word.length > 3);
+    if (questionWords.some((word) => normalized.includes(word))) {
+      return `${chatbot.name}: ${faq.answer}`;
+    }
+  }
+
+  for (const faq of agent.faqs) {
+    const questionWords = faq.question.toLowerCase().split(/[^a-z0-9]+/).filter((word) => word.length > 3);
+    if (questionWords.some((word) => normalized.includes(word))) {
+      return `${chatbot.name}: ${faq.answer}`;
+    }
+  }
+
   if (normalized.includes("hour")) {
     return `${chatbot.name}: We are available during ${agent.businessHours}.`;
   }
@@ -738,13 +1135,6 @@ const findFaqResponse = (message, state, chatbotId = state.organization.activeCh
   }
   if (normalized.includes("appointment") || normalized.includes("book") || normalized.includes("schedule")) {
     return `${chatbot.name}: I can help with that. Please share your name, phone number, and preferred time so the team can confirm the appointment.`;
-  }
-
-  for (const faq of agent.faqs) {
-    const questionWords = faq.question.toLowerCase().split(/[^a-z0-9]+/).filter((word) => word.length > 3);
-    if (questionWords.some((word) => normalized.includes(word))) {
-      return `${chatbot.name}: ${faq.answer}`;
-    }
   }
 
   if (chatbot.customPrompt) {
@@ -765,6 +1155,15 @@ const sanitizeAgentPatch = (body, currentAgent) => {
 
   if ("name" in body) {
     nextAgent.name = assertString(body.name, "agent.name");
+  }
+  if ("direction" in body) {
+    nextAgent.direction = assertEnum(body.direction, VOICE_AGENT_DIRECTIONS, "agent.direction");
+  }
+  if ("twilioPhoneNumber" in body) {
+    nextAgent.twilioPhoneNumber = assertString(body.twilioPhoneNumber, "agent.twilioPhoneNumber", { required: false, maxLength: 50 });
+  }
+  if ("twilioPhoneSid" in body) {
+    nextAgent.twilioPhoneSid = assertString(body.twilioPhoneSid, "agent.twilioPhoneSid", { required: false, maxLength: 100 });
   }
   if ("voice" in body) {
     nextAgent.voice = assertEnum(body.voice, AGENT_VOICES, "agent.voice");
@@ -818,6 +1217,16 @@ const sanitizeChatbotPatch = (body, currentChatbot, state) => {
       throw new HttpError(404, "Linked voice agent not found.");
     }
     nextChatbot.voiceAgentId = voiceAgentId;
+  }
+  if ("faqs" in body) {
+    if (!Array.isArray(body.faqs)) {
+      throw new HttpError(400, "chatbot.faqs must be an array.");
+    }
+    nextChatbot.faqs = body.faqs.map((faq, index) => ({
+      id: assertString(faq?.id || uniqueId(`chatbot_faq_${index + 1}`), "chatbot.faqs[].id", { required: false, maxLength: 100 }) || uniqueId(`chatbot_faq_${index + 1}`),
+      question: assertString(faq?.question, "chatbot.faqs[].question"),
+      answer: assertString(faq?.answer, "chatbot.faqs[].answer"),
+    }));
   }
   if ("headerTitle" in body) {
     nextChatbot.headerTitle = assertString(body.headerTitle, "chatbot.headerTitle", { maxLength: 120 });
@@ -874,9 +1283,9 @@ const appendAuditEvent = (state, action, actorId, details = {}) => {
   state.auditLog = state.auditLog.slice(0, 100);
 };
 
-const buildBootstrapPayload = (req, state, user) => ({
+const buildBootstrapPayload = (req, state, user, twilioRuntimeConfig) => ({
   user,
-  organization: serializeOrganization(req, state.organization),
+  organization: serializeOrganization(req, state.organization, twilioRuntimeConfig),
   leads: state.leads,
   calls: state.calls,
   conversation: getConversation(state),
@@ -1113,11 +1522,12 @@ const buildWidgetScript = (baseUrl) => `(() => {
     });
 })();`;
 
-const route = async (req, res, url, store, routeKey, params) => {
+const route = async (req, res, url, store, routeKey, params, twilioConfig) => {
   const snapshot = await store.read();
   const { session, user } = requireSession(req, snapshot, routeKey);
-  const body = BODY_METHODS.has(req.method) ? await readJsonBody(req) : {};
+  const body = BODY_METHODS.has(req.method) ? await readRequestBody(req) : {};
   const pathname = url.pathname;
+  const workspaceTwilioConfig = getWorkspaceTwilioConfig(req, snapshot.organization?.settings, twilioConfig);
 
   if (routeKey === "GET /health") {
     return sendJson(res, 200, {
@@ -1194,7 +1604,7 @@ const route = async (req, res, url, store, routeKey, params) => {
 
     return sendJson(res, 200, {
       ...result,
-      organization: serializeOrganization(req, result.organization),
+      organization: serializeOrganization(req, result.organization, twilioConfig),
     });
   }
 
@@ -1241,7 +1651,7 @@ const route = async (req, res, url, store, routeKey, params) => {
 
     return sendJson(res, 201, {
       ...result,
-      organization: serializeOrganization(req, result.organization),
+      organization: serializeOrganization(req, result.organization, twilioConfig),
     });
   }
 
@@ -1330,7 +1740,7 @@ const route = async (req, res, url, store, routeKey, params) => {
   }
 
   if (routeKey === "GET /api/bootstrap") {
-    return sendJson(res, 200, buildBootstrapPayload(req, snapshot, user));
+    return sendJson(res, 200, buildBootstrapPayload(req, snapshot, user, twilioConfig));
   }
 
   if (routeKey === "GET /api/dashboard") {
@@ -1338,7 +1748,7 @@ const route = async (req, res, url, store, routeKey, params) => {
   }
 
   if (routeKey === "GET /api/organization") {
-    return sendJson(res, 200, serializeOrganization(req, snapshot.organization));
+    return sendJson(res, 200, serializeOrganization(req, snapshot.organization, twilioConfig));
   }
 
   if (routeKey === "PATCH /api/organization/profile") {
@@ -1376,7 +1786,7 @@ const route = async (req, res, url, store, routeKey, params) => {
   }
 
   if (routeKey === "GET /api/settings") {
-    return sendJson(res, 200, snapshot.organization.settings);
+    return sendJson(res, 200, serializeSettings(req, snapshot.organization.settings, twilioConfig));
   }
 
   if (routeKey === "PATCH /api/settings") {
@@ -1391,11 +1801,48 @@ const route = async (req, res, url, store, routeKey, params) => {
         draft.organization.settings.phoneNumber = assertString(settingsPatch.phoneNumber, "settings.phoneNumber", { maxLength: 50 });
         draft.organization.phoneNumber = draft.organization.settings.phoneNumber;
       }
+      if ("twilio" in settingsPatch) {
+        const twilioPatch = assertObject(settingsPatch.twilio, "settings.twilio");
+        draft.organization.settings.twilio = draft.organization.settings.twilio || {
+          accountSid: "",
+          authToken: "",
+          validateRequests: true,
+        };
+
+        const clearCredentials = "clearCredentials" in twilioPatch
+          ? assertBoolean(twilioPatch.clearCredentials, "settings.twilio.clearCredentials")
+          : false;
+
+        if (clearCredentials) {
+          draft.organization.settings.twilio.accountSid = "";
+          draft.organization.settings.twilio.authToken = "";
+        }
+        if ("accountSid" in twilioPatch) {
+          draft.organization.settings.twilio.accountSid = assertString(
+            twilioPatch.accountSid,
+            "settings.twilio.accountSid",
+            { required: false, maxLength: 80 }
+          );
+        }
+        if ("authToken" in twilioPatch) {
+          draft.organization.settings.twilio.authToken = assertString(
+            twilioPatch.authToken,
+            "settings.twilio.authToken",
+            { required: false, maxLength: 120 }
+          );
+        }
+        if ("validateRequests" in twilioPatch) {
+          draft.organization.settings.twilio.validateRequests = assertBoolean(
+            twilioPatch.validateRequests,
+            "settings.twilio.validateRequests"
+          );
+        }
+      }
       appendAuditEvent(draft, "settings.update", user.id, settingsPatch);
       return draft.organization.settings;
     });
 
-    return sendJson(res, 200, settings);
+    return sendJson(res, 200, serializeSettings(req, settings, twilioConfig));
   }
 
   if (routeKey === "POST /api/onboarding/faqs") {
@@ -1531,6 +1978,122 @@ const route = async (req, res, url, store, routeKey, params) => {
     });
 
     return sendJson(res, 200, activeVoiceAgent);
+  }
+
+  if (routeKey === "POST /api/voice-agents/:id/outbound-calls") {
+    const existingAgent = findVoiceAgentById(snapshot, params.id);
+    if (!existingAgent) {
+      throw new HttpError(404, "Voice agent not found.");
+    }
+    if (existingAgent.direction !== "outbound") {
+      throw new HttpError(400, "Only outbound voice agents can launch Twilio outbound calls.");
+    }
+    if (!existingAgent.twilioPhoneNumber) {
+      throw new HttpError(400, "Assign a Twilio phone number to this voice agent before launching outbound calls.");
+    }
+
+    const to = assertString(body.to, "to", { maxLength: 50 });
+    const contactName = assertString(body.contactName || body.callerName || "", "contactName", { required: false, maxLength: 120 });
+    const prompt = assertString(
+      body.prompt || `Hello, this is ${existingAgent.name} from ${snapshot.organization.profile.name}. I'm following up on your recent inquiry.`,
+      "prompt",
+      { maxLength: 600 }
+    );
+    const machineDetection = body.machineDetection
+      ? assertEnum(body.machineDetection, ["Enable", "DetectMessageEnd"], "machineDetection")
+      : "";
+
+    const outboundSessionId = uniqueId("twilio_outbound");
+    await store.update((draft) => {
+      ensureTwilioState(draft);
+      draft.twilio.pendingOutboundCalls[outboundSessionId] = {
+        id: outboundSessionId,
+        agentId: existingAgent.id,
+        customerPhone: to,
+        customerName: contactName,
+        prompt,
+        createdByUserId: user.id,
+        createdAt: nowIso(),
+        machineDetection,
+        status: "queued",
+        callSid: "",
+      };
+    });
+
+    const instructionsUrl = buildTwilioWebhookUrl(
+      req,
+      workspaceTwilioConfig,
+      `/api/twilio/voice/${encodeURIComponent(existingAgent.id)}/outbound/${encodeURIComponent(outboundSessionId)}/twiml`
+    );
+    const statusCallbackParams = new URLSearchParams({
+      sessionId: outboundSessionId,
+      agentId: existingAgent.id,
+    });
+    const statusCallbackUrl = buildTwilioWebhookUrl(req, workspaceTwilioConfig, "/api/twilio/voice/status", statusCallbackParams);
+
+    let createdCall;
+    try {
+      createdCall = await createTwilioCall({
+        config: workspaceTwilioConfig,
+        to,
+        from: existingAgent.twilioPhoneNumber,
+        instructionsUrl,
+        statusCallbackUrl,
+        machineDetection,
+      });
+    } catch (error) {
+      await store.update((draft) => {
+        ensureTwilioState(draft);
+        delete draft.twilio.pendingOutboundCalls[outboundSessionId];
+      });
+      throw new HttpError(502, error.message);
+    }
+
+    const responsePayload = await store.update((draft) => {
+      ensureTwilioState(draft);
+      const pending = draft.twilio.pendingOutboundCalls[outboundSessionId];
+      if (!pending) {
+        throw new HttpError(500, "Outbound call session was lost before it could be stored.");
+      }
+
+      pending.callSid = createdCall.sid || "";
+      pending.status = createdCall.status || "queued";
+
+      const twilioSession = createTwilioSession({
+        agent: existingAgent,
+        direction: "outbound",
+        callSid: createdCall.sid || uniqueId("twilio_call"),
+        customerPhone: to,
+        customerName: contactName,
+        prompt,
+        outboundSessionId,
+      });
+      twilioSession.startedAt = pending.createdAt;
+      twilioSession.updatedAt = nowIso();
+      twilioSession.status = createdCall.status || "queued";
+
+      draft.twilio.activeCalls[twilioSession.callSid] = twilioSession;
+      appendAuditEvent(draft, "twilio.outbound_call.create", user.id, {
+        voiceAgentId: existingAgent.id,
+        callSid: twilioSession.callSid,
+        to,
+        from: existingAgent.twilioPhoneNumber,
+      });
+
+      return {
+        id: outboundSessionId,
+        callSid: twilioSession.callSid,
+        status: createdCall.status || "queued",
+        to,
+        from: existingAgent.twilioPhoneNumber,
+        direction: "outbound",
+        prompt,
+        instructionsUrl,
+        statusCallbackUrl,
+      };
+    });
+
+    return sendJson(res, 201, responsePayload);
   }
 
   if (routeKey === "GET /api/chatbots") {
@@ -1702,8 +2265,10 @@ const route = async (req, res, url, store, routeKey, params) => {
 
   if (routeKey === "POST /api/agent/restart") {
     await store.update((draft) => {
+      const activeVoiceAgent = getActiveVoiceAgent(draft);
       appendAuditEvent(draft, "agent.restart", user.id, {
-        phoneNumber: draft.organization.phoneNumber,
+        phoneNumber: activeVoiceAgent.twilioPhoneNumber || draft.organization.phoneNumber,
+        direction: activeVoiceAgent.direction,
       });
     });
 
@@ -1827,6 +2392,433 @@ const route = async (req, res, url, store, routeKey, params) => {
         name: chatbot.name,
       },
     });
+  }
+
+  if (routeKey === "POST /api/twilio/voice/:id/inbound") {
+    requireTwilioRequestValidation(req, url, body, workspaceTwilioConfig);
+
+    const agent = findVoiceAgentById(snapshot, params.id);
+    if (!agent) {
+      throw new HttpError(404, "Voice agent not found.");
+    }
+    if (agent.direction !== "inbound") {
+      throw new HttpError(400, "This voice agent is configured for outbound calling, not inbound webhooks.");
+    }
+
+    const callSid = assertString(body.CallSid, "CallSid", { maxLength: 120 });
+    const callerPhone = assertString(body.From || body.Caller || "", "From", { required: false, maxLength: 50 });
+    const callerName = assertString(body.CallerName || "", "CallerName", { required: false, maxLength: 120 });
+
+    await store.update((draft) => {
+      ensureTwilioState(draft);
+      const existingSession = getTwilioActiveCall(draft, callSid);
+      const nextSession = existingSession || createTwilioSession({
+        agent,
+        direction: "inbound",
+        callSid,
+        customerPhone: callerPhone,
+        customerName: callerName,
+      });
+
+      nextSession.customerPhone = nextSession.customerPhone || callerPhone;
+      nextSession.customerName = nextSession.customerName || callerName;
+      nextSession.status = assertString(body.CallStatus || "in-progress", "CallStatus", { maxLength: 50 });
+      nextSession.updatedAt = nowIso();
+      if (nextSession.transcript.length === 0) {
+        appendTranscriptLine(nextSession, "Agent", agent.greeting);
+      }
+      nextSession.twilioStatusHistory.unshift({
+        status: nextSession.status,
+        timestamp: nowIso(),
+      });
+      nextSession.twilioStatusHistory = nextSession.twilioStatusHistory.slice(0, 10);
+      draft.twilio.activeCalls[callSid] = nextSession;
+    });
+
+    const gather = twimlGather(
+      buildGatherActionAttributes(req, workspaceTwilioConfig, `/api/twilio/voice/${encodeURIComponent(agent.id)}/continue`, agent),
+      twimlSay(agent.greeting)
+    );
+
+    return sendXml(
+      res,
+      200,
+      buildTwimlResponse(
+        gather,
+        twimlSay("Thanks for calling. Goodbye."),
+        twimlHangup()
+      )
+    );
+  }
+
+  if (routeKey === "POST /api/twilio/voice/:id/continue") {
+    requireTwilioRequestValidation(req, url, body, workspaceTwilioConfig);
+
+    const agent = findVoiceAgentById(snapshot, params.id);
+    if (!agent) {
+      throw new HttpError(404, "Voice agent not found.");
+    }
+
+    const callSid = assertString(body.CallSid, "CallSid", { maxLength: 120 });
+    const speechResult = assertString(
+      body.SpeechResult || (["0", "1"].includes(body.Digits) ? "transfer me to a human" : body.Digits || ""),
+      "SpeechResult",
+      { required: false, maxLength: 1000 }
+    );
+
+    if (!speechResult) {
+      return sendXml(res, 200, buildTwimlResponse(
+        twimlSay("Thanks for calling. Goodbye."),
+        twimlHangup()
+      ));
+    }
+
+    const turn = await store.update((draft) => {
+      ensureTwilioState(draft);
+      const session = getTwilioActiveCall(draft, callSid) || createTwilioSession({
+        agent,
+        direction: "inbound",
+        callSid,
+        customerPhone: assertString(body.From || "", "From", { required: false, maxLength: 50 }),
+        customerName: assertString(body.CallerName || "", "CallerName", { required: false, maxLength: 120 }),
+      });
+
+      const nextTurn = buildVoiceTurn({
+        message: speechResult,
+        state: draft,
+        agent,
+        session,
+      });
+
+      session.customerPhone = session.customerPhone || assertString(body.From || "", "From", { required: false, maxLength: 50 });
+      session.customerName = session.customerName || assertString(body.CallerName || "", "CallerName", { required: false, maxLength: 120 });
+      session.lead = mergeLeadDetails(session.lead, nextTurn.leadDetails);
+      session.shouldCaptureLead = session.shouldCaptureLead || nextTurn.shouldCaptureLead;
+      session.outcome = mergeCallOutcome(session.outcome, nextTurn.outcome);
+      session.turnCount += 1;
+      session.updatedAt = nowIso();
+      session.status = assertString(body.CallStatus || session.status || "in-progress", "CallStatus", { maxLength: 50 });
+      appendTranscriptLine(session, "Caller", speechResult);
+      appendTranscriptLine(session, "Agent", nextTurn.responseText);
+      if (nextTurn.shouldContinue) {
+        appendTranscriptLine(session, "Agent", "Is there anything else I can help you with today?");
+      }
+      draft.twilio.activeCalls[callSid] = session;
+
+      return nextTurn;
+    });
+
+    if (turn.shouldDial) {
+      return sendXml(
+        res,
+        200,
+        buildTwimlResponse(
+          twimlSay(turn.responseText),
+          twimlDial(agent.escalationPhone)
+        )
+      );
+    }
+
+    if (turn.shouldContinue) {
+      const gather = twimlGather(
+        buildGatherActionAttributes(req, workspaceTwilioConfig, `/api/twilio/voice/${encodeURIComponent(agent.id)}/continue`, agent),
+        twimlSay(turn.responseText) + twimlPause(1) + twimlSay("Is there anything else I can help you with today?")
+      );
+
+      return sendXml(
+        res,
+        200,
+        buildTwimlResponse(
+          gather,
+          twimlSay("Thanks for calling. Goodbye."),
+          twimlHangup()
+        )
+      );
+    }
+
+    return sendXml(
+      res,
+      200,
+      buildTwimlResponse(
+        twimlSay(turn.responseText),
+        twimlSay("Thanks for calling. Goodbye."),
+        twimlHangup()
+      )
+    );
+  }
+
+  if (routeKey === "POST /api/twilio/voice/:id/outbound/:sessionId/twiml") {
+    requireTwilioRequestValidation(req, url, body, workspaceTwilioConfig);
+
+    const agent = findVoiceAgentById(snapshot, params.id);
+    if (!agent) {
+      throw new HttpError(404, "Voice agent not found.");
+    }
+    if (agent.direction !== "outbound") {
+      throw new HttpError(400, "This voice agent is not configured for outbound calling.");
+    }
+
+    const pending = getPendingTwilioOutboundCall(snapshot, params.sessionId);
+    if (!pending) {
+      throw new HttpError(404, "Outbound call session not found.");
+    }
+
+    const callSid = assertString(body.CallSid, "CallSid", { maxLength: 120 });
+    await store.update((draft) => {
+      ensureTwilioState(draft);
+      const session = getTwilioActiveCall(draft, callSid) || createTwilioSession({
+        agent,
+        direction: "outbound",
+        callSid,
+        customerPhone: pending.customerPhone || assertString(body.To || "", "To", { required: false, maxLength: 50 }),
+        customerName: pending.customerName || "",
+        prompt: pending.prompt,
+        outboundSessionId: params.sessionId,
+      });
+
+      session.customerPhone = session.customerPhone || pending.customerPhone || assertString(body.To || "", "To", { required: false, maxLength: 50 });
+      session.customerName = session.customerName || pending.customerName || "";
+      session.prompt = session.prompt || pending.prompt || "";
+      session.status = assertString(body.CallStatus || "in-progress", "CallStatus", { maxLength: 50 });
+      session.updatedAt = nowIso();
+      if (session.transcript.length === 0) {
+        appendTranscriptLine(session, "Agent", agent.greeting);
+        appendTranscriptLine(session, "Agent", session.prompt);
+      }
+      draft.twilio.activeCalls[callSid] = session;
+      draft.twilio.pendingOutboundCalls[params.sessionId] = {
+        ...pending,
+        callSid,
+        status: session.status,
+      };
+    });
+
+    const gather = twimlGather(
+      buildGatherActionAttributes(
+        req,
+        workspaceTwilioConfig,
+        `/api/twilio/voice/${encodeURIComponent(agent.id)}/outbound/${encodeURIComponent(params.sessionId)}/continue`,
+        agent
+      ),
+      twimlSay(agent.greeting)
+        + twimlPause(1)
+        + twimlSay(pending.prompt)
+        + twimlPause(1)
+        + twimlSay("You can tell me more about your needs, or press 1 if you want to be connected to our team.")
+    );
+
+    return sendXml(
+      res,
+      200,
+      buildTwimlResponse(
+        gather,
+        twimlSay("Thanks for your time. Goodbye."),
+        twimlHangup()
+      )
+    );
+  }
+
+  if (routeKey === "POST /api/twilio/voice/:id/outbound/:sessionId/continue") {
+    requireTwilioRequestValidation(req, url, body, workspaceTwilioConfig);
+
+    const agent = findVoiceAgentById(snapshot, params.id);
+    if (!agent) {
+      throw new HttpError(404, "Voice agent not found.");
+    }
+
+    const pending = getPendingTwilioOutboundCall(snapshot, params.sessionId);
+    if (!pending) {
+      throw new HttpError(404, "Outbound call session not found.");
+    }
+
+    const callSid = assertString(body.CallSid, "CallSid", { maxLength: 120 });
+    const speechResult = assertString(
+      body.SpeechResult || (["0", "1"].includes(body.Digits) ? "transfer me to a human" : body.Digits || ""),
+      "SpeechResult",
+      { required: false, maxLength: 1000 }
+    );
+
+    if (!speechResult) {
+      return sendXml(res, 200, buildTwimlResponse(
+        twimlSay("Thanks for your time. Goodbye."),
+        twimlHangup()
+      ));
+    }
+
+    const turn = await store.update((draft) => {
+      ensureTwilioState(draft);
+      const session = getTwilioActiveCall(draft, callSid) || createTwilioSession({
+        agent,
+        direction: "outbound",
+        callSid,
+        customerPhone: pending.customerPhone || assertString(body.To || "", "To", { required: false, maxLength: 50 }),
+        customerName: pending.customerName || "",
+        prompt: pending.prompt,
+        outboundSessionId: params.sessionId,
+      });
+
+      const nextTurn = buildVoiceTurn({
+        message: speechResult,
+        state: draft,
+        agent,
+        session,
+      });
+
+      session.customerPhone = session.customerPhone || pending.customerPhone || assertString(body.To || "", "To", { required: false, maxLength: 50 });
+      session.customerName = session.customerName || pending.customerName || "";
+      session.lead = mergeLeadDetails(session.lead, nextTurn.leadDetails);
+      session.shouldCaptureLead = session.shouldCaptureLead || nextTurn.shouldCaptureLead;
+      session.outcome = mergeCallOutcome(session.outcome, nextTurn.outcome);
+      session.turnCount += 1;
+      session.updatedAt = nowIso();
+      session.status = assertString(body.CallStatus || session.status || "in-progress", "CallStatus", { maxLength: 50 });
+      appendTranscriptLine(session, "Caller", speechResult);
+      appendTranscriptLine(session, "Agent", nextTurn.responseText);
+      if (nextTurn.shouldContinue) {
+        appendTranscriptLine(session, "Agent", "Is there anything else you'd like us to help with?");
+      }
+      draft.twilio.activeCalls[callSid] = session;
+
+      return nextTurn;
+    });
+
+    if (turn.shouldDial) {
+      return sendXml(
+        res,
+        200,
+        buildTwimlResponse(
+          twimlSay(turn.responseText),
+          twimlDial(agent.escalationPhone)
+        )
+      );
+    }
+
+    if (turn.shouldContinue) {
+      const gather = twimlGather(
+        buildGatherActionAttributes(
+          req,
+          workspaceTwilioConfig,
+          `/api/twilio/voice/${encodeURIComponent(agent.id)}/outbound/${encodeURIComponent(params.sessionId)}/continue`,
+          agent
+        ),
+        twimlSay(turn.responseText) + twimlPause(1) + twimlSay("Is there anything else you'd like us to help with?")
+      );
+
+      return sendXml(
+        res,
+        200,
+        buildTwimlResponse(
+          gather,
+          twimlSay("Thanks for your time. Goodbye."),
+          twimlHangup()
+        )
+      );
+    }
+
+    return sendXml(
+      res,
+      200,
+      buildTwimlResponse(
+        twimlSay(turn.responseText),
+        twimlSay("Thanks for your time. Goodbye."),
+        twimlHangup()
+      )
+    );
+  }
+
+  if (routeKey === "POST /api/twilio/voice/status") {
+    requireTwilioRequestValidation(req, url, body, workspaceTwilioConfig);
+
+    const callSid = assertString(body.CallSid, "CallSid", { maxLength: 120 });
+    const callStatus = assertString(body.CallStatus || "unknown", "CallStatus", { maxLength: 50 });
+    const sessionId = assertString(url.searchParams.get("sessionId") || "", "sessionId", { required: false, maxLength: 120 });
+    const result = await store.update((draft) => {
+      ensureTwilioState(draft);
+
+      let session = getTwilioActiveCall(draft, callSid);
+      const pending = sessionId ? getPendingTwilioOutboundCall(draft, sessionId) : null;
+      if (!session && pending) {
+        const pendingAgent = findVoiceAgentById(draft, pending.agentId);
+        if (pendingAgent) {
+          session = createTwilioSession({
+            agent: pendingAgent,
+            direction: "outbound",
+            callSid,
+            customerPhone: pending.customerPhone,
+            customerName: pending.customerName,
+            prompt: pending.prompt,
+            outboundSessionId: sessionId,
+          });
+          session.startedAt = pending.createdAt;
+          draft.twilio.activeCalls[callSid] = session;
+        }
+      }
+
+      if (!session) {
+        return {
+          success: true,
+          callSid,
+          status: callStatus,
+          finalized: false,
+        };
+      }
+
+      session.callSid = callSid;
+      session.status = callStatus;
+      session.updatedAt = nowIso();
+      session.answeredBy = assertString(body.AnsweredBy || session.answeredBy || "", "AnsweredBy", { required: false, maxLength: 120 });
+      session.duration = Number.parseInt(body.CallDuration || session.duration || "0", 10) || 0;
+      session.customerPhone = session.customerPhone
+        || (session.direction === "outbound"
+          ? assertString(body.To || "", "To", { required: false, maxLength: 50 })
+          : assertString(body.From || "", "From", { required: false, maxLength: 50 }));
+      session.twilioStatusHistory.unshift({
+        status: callStatus,
+        timestamp: nowIso(),
+      });
+      session.twilioStatusHistory = session.twilioStatusHistory.slice(0, 10);
+
+      if (pending) {
+        draft.twilio.pendingOutboundCalls[sessionId] = {
+          ...pending,
+          callSid,
+          status: callStatus,
+        };
+      }
+
+      if (["busy", "failed", "no-answer", "canceled"].includes(callStatus)) {
+        session.outcome = mergeCallOutcome(session.outcome, CALL_OUTCOMES.VOICEMAIL);
+      }
+
+      if (["completed", "busy", "failed", "no-answer", "canceled"].includes(callStatus)) {
+        const finalized = finalizeTwilioCallSession(draft, session, { callStatus });
+        appendAuditEvent(draft, "twilio.call.completed", session.direction === "outbound" ? (pending?.createdByUserId || "system") : "system", {
+          callSid,
+          callStatus,
+          direction: session.direction,
+          voiceAgentId: session.agentId,
+          callRecordId: finalized.call?.id || null,
+        });
+
+        return {
+          success: true,
+          callSid,
+          status: callStatus,
+          finalized: true,
+          call: finalized.call,
+          lead: finalized.lead,
+        };
+      }
+
+      return {
+        success: true,
+        callSid,
+        status: callStatus,
+        finalized: false,
+      };
+    });
+
+    return sendJson(res, 200, result);
   }
 
   if (routeKey === "GET /api/calls") {
@@ -2277,6 +3269,7 @@ const buildRouteKey = (method, pathname) => {
     "/api/billing/invoices",
     "/api/contact",
     "/api/contact-sales",
+    "/api/twilio/voice/status",
   ];
 
   if (exactRoutes.includes(pathname)) {
@@ -2286,12 +3279,17 @@ const buildRouteKey = (method, pathname) => {
   const dynamicPatterns = [
     "/api/voice-agents/:id",
     "/api/voice-agents/:id/activate",
+    "/api/voice-agents/:id/outbound-calls",
     "/api/agent/faqs/:id",
     "/api/chatbots/:id",
     "/api/chatbots/:id/activate",
     "/api/chatbots/:id/embed",
     "/api/public/chatbots/:id/config",
     "/api/public/chatbots/:id/messages",
+    "/api/twilio/voice/:id/inbound",
+    "/api/twilio/voice/:id/continue",
+    "/api/twilio/voice/:id/outbound/:sessionId/twiml",
+    "/api/twilio/voice/:id/outbound/:sessionId/continue",
     "/api/calls/:id",
     "/api/calls/:id/transcript",
     "/api/calls/:id/report",
@@ -2316,7 +3314,9 @@ export const createAgentlyServer = async ({
   host = DEFAULT_HOST,
   dataFile = DEFAULT_DATA_FILE,
   storeProvider,
+  twilio,
 } = {}) => {
+  const twilioConfig = resolveTwilioConfig(twilio);
   const store = createStore({
     provider: storeProvider,
     dataFile,
@@ -2343,7 +3343,7 @@ export const createAgentlyServer = async ({
         throw new HttpError(404, `No handler was found for ${url.pathname}.`);
       }
 
-      await route(req, res, url, store, routeKey, params);
+      await route(req, res, url, store, routeKey, params, twilioConfig);
     } catch (error) {
       if (error instanceof HttpError) {
         sendJson(res, error.status, {

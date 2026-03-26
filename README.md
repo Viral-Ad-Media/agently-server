@@ -46,6 +46,10 @@ Important variables:
 - `SUPABASE_STATE_TABLE`: table name, defaults to `agently_state`
 - `SUPABASE_STATE_ROW_ID`: row id, defaults to `primary`
 - `AGENTLY_DATA_FILE`: JSON fallback path when `AGENTLY_STORE_PROVIDER=json`
+- `TWILIO_ACCOUNT_SID`: optional server-level fallback for local development or single-tenant installs
+- `TWILIO_AUTH_TOKEN`: optional server-level fallback for local development or single-tenant installs
+- `TWILIO_WEBHOOK_BASE_URL`: optional override for the public backend origin Twilio will call, for example `https://agently-server.vercel.app`
+- `TWILIO_VALIDATE_REQUESTS`: defaults to `true`; workspace settings can override this per customer
 
 ### 3. Start the server
 
@@ -56,6 +60,29 @@ npm run start
 ```
 
 The server listens on `http://localhost:4000` by default.
+
+## Twilio Voice Integration
+
+The backend now supports real Twilio inbound voice webhooks and outbound call initiation.
+Each workspace can now save its own Twilio Account SID and Auth Token from the Settings screen, so customer traffic does not depend on one global Twilio account for the whole SaaS. The `TWILIO_*` environment variables are now only fallback defaults.
+
+Inbound setup:
+
+- create or pick an inbound voice agent in Agently
+- connect that workspace's Twilio account from the Settings screen
+- assign that agent a real Twilio number and save the number SID in the agent settings
+- in Twilio Console, configure that phone number's Voice webhook to `HTTP POST`
+- point it to:
+  - `https://your-backend.example.com/api/twilio/voice/<voice-agent-id>/inbound`
+
+Outbound setup:
+
+- create an outbound voice agent with a Twilio number assigned
+- connect that workspace's Twilio account from the Settings screen
+- call `POST /api/voice-agents/:id/outbound-calls` with a `to` number and optional `contactName`, `prompt`, and `machineDetection`
+- the backend will create the Twilio call, serve outbound TwiML, receive status callbacks, and write the completed call into the existing call log and lead pipeline
+
+The backend signs and validates Twilio traffic using `X-Twilio-Signature` when request validation is enabled for that workspace. The Twilio-generated instruction and status callback URLs are built from `TWILIO_WEBHOOK_BASE_URL` when it is set, otherwise from the current public request origin.
 
 ## Vercel Deployment
 
@@ -69,6 +96,10 @@ For production on Vercel, set these environment variables:
 - `SUPABASE_SCHEMA`
 - `SUPABASE_STATE_TABLE`
 - `SUPABASE_STATE_ROW_ID`
+- `TWILIO_ACCOUNT_SID`
+- `TWILIO_AUTH_TOKEN`
+- `TWILIO_WEBHOOK_BASE_URL`
+- `TWILIO_VALIDATE_REQUESTS=true`
 
 If those Supabase variables are missing, the app will fall back to the JSON store. On Vercel that fallback uses `/tmp/agently-store.json`, which prevents a read-only filesystem crash but does not give durable persistence across deployments or cold starts.
 
@@ -109,6 +140,12 @@ curl -X POST http://localhost:4000/api/auth/login \
 - `PATCH /api/settings`
 - `POST /api/onboarding/faqs`
 - `POST /api/onboarding/complete`
+- `GET /api/voice-agents`
+- `POST /api/voice-agents`
+- `PATCH /api/voice-agents/:id`
+- `DELETE /api/voice-agents/:id`
+- `POST /api/voice-agents/:id/activate`
+- `POST /api/voice-agents/:id/outbound-calls`
 - `GET /api/agent`
 - `PATCH /api/agent`
 - `GET /api/agent/faqs`
@@ -117,9 +154,17 @@ curl -X POST http://localhost:4000/api/auth/login \
 - `DELETE /api/agent/faqs/:id`
 - `POST /api/agent/faqs/sync`
 - `POST /api/agent/restart`
+- `GET /api/chatbots`
+- `POST /api/chatbots`
+- `PATCH /api/chatbots/:id`
+- `DELETE /api/chatbots/:id`
+- `POST /api/chatbots/:id/activate`
+- `GET /api/chatbots/:id/embed`
 - `GET /api/messenger/messages`
 - `POST /api/messenger/messages`
 - `DELETE /api/messenger/messages`
+- `GET /api/public/chatbots/:id/config`
+- `POST /api/public/chatbots/:id/messages`
 - `GET /api/calls`
 - `POST /api/calls/simulate`
 - `GET /api/calls/:id`
@@ -142,6 +187,11 @@ curl -X POST http://localhost:4000/api/auth/login \
 - `GET /api/billing/invoices/:id/download`
 - `POST /api/contact`
 - `POST /api/contact-sales`
+- `POST /api/twilio/voice/:id/inbound`
+- `POST /api/twilio/voice/:id/continue`
+- `POST /api/twilio/voice/:id/outbound/:sessionId/twiml`
+- `POST /api/twilio/voice/:id/outbound/:sessionId/continue`
+- `POST /api/twilio/voice/status`
 
 ## Verification
 

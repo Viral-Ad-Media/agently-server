@@ -14,6 +14,7 @@ export const USER_ROLES = ["Owner", "Admin", "Viewer"];
 export const AGENT_TONES = ["Professional", "Friendly", "Empathetic"];
 export const AGENT_LANGUAGES = ["English", "Spanish", "French", "German"];
 export const AGENT_VOICES = ["Zephyr", "Puck", "Charon", "Kore", "Fenrir"];
+export const VOICE_AGENT_DIRECTIONS = ["inbound", "outbound"];
 export const CHATBOT_POSITIONS = ["left", "right"];
 export const SUBSCRIPTION_PLANS = ["Starter", "Pro", "None"];
 
@@ -55,9 +56,18 @@ export const INITIAL_FAQS = [
 
 const cloneFaqs = (faqs = INITIAL_FAQS) => faqs.map((faq) => ({ ...faq }));
 
+export const createTwilioSettings = (overrides = {}) => ({
+  accountSid: overrides.accountSid || "",
+  authToken: overrides.authToken || "",
+  validateRequests: overrides.validateRequests ?? true,
+});
+
 export const createVoiceAgent = (overrides = {}) => ({
   id: overrides.id || "voice_agent_1",
   name: overrides.name || "Maya",
+  direction: overrides.direction || "inbound",
+  twilioPhoneNumber: overrides.twilioPhoneNumber || "+1 (202) 555-0199",
+  twilioPhoneSid: overrides.twilioPhoneSid || "PN_demo_voice_agent_1",
   voice: overrides.voice || "Zephyr",
   language: overrides.language || "English",
   greeting: overrides.greeting || "Hello, thank you for calling Bright Path Dental. This is Maya. How can I assist you today?",
@@ -80,6 +90,7 @@ export const createChatbot = (overrides = {}) => ({
   id: overrides.id || "chatbot_1",
   name: overrides.name || "Website Concierge",
   voiceAgentId: overrides.voiceAgentId || "voice_agent_1",
+  faqs: cloneFaqs(overrides.faqs),
   headerTitle: overrides.headerTitle || "Bright Path Dental Assistant",
   welcomeMessage: overrides.welcomeMessage || "Hi there! I'm here to answer questions, capture details, and help your visitors get the right next step.",
   placeholder: overrides.placeholder || "Ask about services, pricing, or availability...",
@@ -172,6 +183,7 @@ export const createDefaultState = () => ({
     settings: {
       timezone: "America/New_York",
       phoneNumber: "+1 (202) 555-0199",
+      twilio: createTwilioSettings(),
     },
   },
   leads: [
@@ -266,6 +278,10 @@ export const createDefaultState = () => ({
   contactMessages: [],
   salesInquiries: [],
   auditLog: [],
+  twilio: {
+    activeCalls: {},
+    pendingOutboundCalls: {},
+  },
 });
 
 const isPlainObject = (value) => value != null && typeof value === "object" && !Array.isArray(value);
@@ -282,6 +298,7 @@ const hydrateChatbot = (chatbot, index, fallbackVoiceAgentId, organizationName) 
   ...chatbot,
   id: chatbot?.id || `chatbot_${index + 1}`,
   voiceAgentId: chatbot?.voiceAgentId || fallbackVoiceAgentId,
+  faqs: Array.isArray(chatbot?.faqs) && chatbot.faqs.length > 0 ? chatbot.faqs : INITIAL_FAQS,
   headerTitle: chatbot?.headerTitle || `${organizationName} Assistant`,
 });
 
@@ -301,6 +318,16 @@ export const normalizeWorkspaceState = (state) => {
 
   const activeVoiceAgent = organization.voiceAgents.find((agent) => agent.id === organization.activeVoiceAgentId) || organization.voiceAgents[0];
   organization.agent = activeVoiceAgent;
+  organization.settings = {
+    timezone: organization.settings?.timezone || organization.profile?.timezone || "America/New_York",
+    phoneNumber: organization.settings?.phoneNumber || organization.phoneNumber || "",
+    twilio: createTwilioSettings(organization.settings?.twilio),
+  };
+  organization.profile = {
+    ...organization.profile,
+    timezone: organization.settings.timezone,
+  };
+  organization.phoneNumber = organization.settings.phoneNumber || organization.phoneNumber || "";
 
   const chatbotsSource = Array.isArray(organization.chatbots) && organization.chatbots.length > 0
     ? organization.chatbots
@@ -338,6 +365,9 @@ export const normalizeWorkspaceState = (state) => {
 
   next.conversations.byChatbotId = normalizedByChatbotId;
   next.conversations.default = next.conversations.byChatbotId[organization.activeChatbotId] || [];
+  next.twilio = isPlainObject(next.twilio) ? next.twilio : {};
+  next.twilio.activeCalls = isPlainObject(next.twilio.activeCalls) ? next.twilio.activeCalls : {};
+  next.twilio.pendingOutboundCalls = isPlainObject(next.twilio.pendingOutboundCalls) ? next.twilio.pendingOutboundCalls : {};
 
   return next;
 };

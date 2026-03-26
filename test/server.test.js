@@ -1,12 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createHmac } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 
 import { createAgentlyServer } from "../src/server.js";
 
-const createTestContext = async (t, { initialState } = {}) => {
+const createTestContext = async (t, { initialState, twilio } = {}) => {
   const tempDirectory = await mkdtemp(path.join(os.tmpdir(), "agently-server-"));
   const dataFile = path.join(tempDirectory, "store.json");
   if (initialState !== undefined) {
@@ -15,6 +16,7 @@ const createTestContext = async (t, { initialState } = {}) => {
   const { handler } = await createAgentlyServer({
     dataFile,
     storeProvider: "json",
+    twilio,
   });
 
   t.after(async () => {
@@ -25,23 +27,26 @@ const createTestContext = async (t, { initialState } = {}) => {
 };
 
 const invoke = async ({ handler, method, path: requestPath, token, body, headers: extraHeaders = {} }) => {
+  const headers = {
+    host: "localhost:4000",
+  };
+  Object.assign(headers, extraHeaders);
+
+  const requestContentType = String(headers["content-type"] || headers["Content-Type"] || "").toLowerCase();
   const payload = body == null
     ? ""
     : typeof body === "string"
       ? body
-      : JSON.stringify(body);
+      : requestContentType.includes("application/x-www-form-urlencoded")
+        ? new URLSearchParams(body).toString()
+        : JSON.stringify(body);
 
-  const headers = {
-    host: "localhost:4000",
-  };
-
-  if (payload) {
+  if (payload && !requestContentType) {
     headers["content-type"] = "application/json";
   }
   if (token) {
     headers.authorization = `Bearer ${token}`;
   }
-  Object.assign(headers, extraHeaders);
 
   const req = {
     method,
@@ -88,6 +93,14 @@ const invoke = async ({ handler, method, path: requestPath, token, body, headers
     text: responseState.body,
     json: parsedJson,
   };
+};
+
+const buildTwilioTestSignature = ({ authToken, requestUrl, params = {} }) => {
+  const payload = Object.keys(params)
+    .sort()
+    .reduce((result, key) => result + key + String(params[key] ?? ""), requestUrl);
+
+  return createHmac("sha1", authToken).update(payload, "utf8").digest("base64");
 };
 
 test("health route returns ok", async (t) => {
@@ -198,6 +211,9 @@ test("voice agent and chatbot collections support creation and public embed deli
     token,
     body: {
       name: "Lucia",
+      direction: "outbound",
+      twilioPhoneNumber: "+1 (833) 555-0110",
+      twilioPhoneSid: "PNluciaoutbound",
       language: "Spanish",
       tone: "Friendly",
     },
@@ -205,6 +221,8 @@ test("voice agent and chatbot collections support creation and public embed deli
 
   assert.equal(voiceAgentResponse.status, 201);
   assert.equal(voiceAgentResponse.json.name, "Lucia");
+  assert.equal(voiceAgentResponse.json.direction, "outbound");
+  assert.equal(voiceAgentResponse.json.twilioPhoneNumber, "+1 (833) 555-0110");
 
   const chatbotResponse = await invoke({
     handler,
@@ -216,6 +234,13 @@ test("voice agent and chatbot collections support creation and public embed deli
       voiceAgentId: voiceAgentResponse.json.id,
       accentColor: "#0EA5E9",
       welcomeMessage: "Hi! I can help visitors book faster.",
+      faqs: [
+        {
+          id: "booking_policy",
+          question: "Do you offer Saturday appointments?",
+          answer: "Yes. Saturday booking requests are supported through this chatbot and routed for confirmation within one business day.",
+        },
+      ],
     },
   });
 
@@ -236,12 +261,12 @@ test("voice agent and chatbot collections support creation and public embed deli
     method: "POST",
     path: `/api/public/chatbots/${chatbotResponse.json.id}/messages`,
     body: {
-      message: "What are your hours?",
+      message: "Do you offer Saturday appointments?",
     },
   });
 
   assert.equal(publicMessageResponse.status, 200);
-  assert.ok(publicMessageResponse.json.assistantMessage.text.includes("Booking Bot"));
+  assert.ok(publicMessageResponse.json.assistantMessage.text.includes("Saturday booking requests"));
 
   const embedScriptResponse = await invoke({
     handler,
@@ -310,4 +335,288 @@ test("faq sync, messenger, call simulation, and csv export all respond", async (
   const csvText = csvResponse.text;
   assert.ok(csvText.includes("name,email,phone"));
   assert.ok(csvText.includes("Jamie North"));
+});
+
+test("twilio inbound webhooks validate signatures and finalize a real inbound call", async (t) => {
+  const twilioAuthToken = "twilio-test-token";
+  const twilioBaseUrl = "https://agently-server.test";
+  const { handler } = await createTestContext(t, {
+    twilio: {
+      webhookBaseUrl: twilioBaseUrl,
+      validateRequests: true,
+    },
+  });
+
+  const connectResponse = await invoke({
+    handler,
+    method: "PATCH",
+    path: "/api/settings",
+    token: "demo-owner-token",
+    body: {
+      twilio: {
+        accountSid: "ACworkspace123",
+        authToken: twilioAuthToken,
+        validateRequests: true,
+      },
+    },
+  });
+
+  assert.equal(connectResponse.status, 200);
+  assert.equal(connectResponse.json.twilio.accountSid, "ACworkspace123");
+  assert.equal(connectResponse.json.twilio.authTokenConfigured, true);
+  assert.equal(connectResponse.json.twilio.authTokenLastFour, "oken");
+  assert.equal(Object.prototype.hasOwnProperty.call(connectResponse.json.twilio, "authToken"), false);
+
+  const inboundBody = {
+    CallSid: "CAinbound123",
+    From: "+15551234567",
+    CallerName: "Jamie North",
+    CallStatus: "in-progress",
+  };
+
+  const inboundSignature = buildTwilioTestSignature({
+    authToken: twilioAuthToken,
+    requestUrl: `${twilioBaseUrl}/api/twilio/voice/voice_agent_1/inbound`,
+    params: inboundBody,
+  });
+
+  const inboundResponse = await invoke({
+    handler,
+    method: "POST",
+    path: "/api/twilio/voice/voice_agent_1/inbound",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      "x-twilio-signature": inboundSignature,
+    },
+    body: inboundBody,
+  });
+
+  assert.equal(inboundResponse.status, 200);
+  assert.ok(inboundResponse.text.includes("<Gather"));
+  assert.ok(inboundResponse.text.includes("How can I assist you today?"));
+
+  const continueBody = {
+    CallSid: "CAinbound123",
+    From: "+15551234567",
+    CallerName: "Jamie North",
+    CallStatus: "in-progress",
+    SpeechResult: "What are your office hours?",
+  };
+  const continueSignature = buildTwilioTestSignature({
+    authToken: twilioAuthToken,
+    requestUrl: `${twilioBaseUrl}/api/twilio/voice/voice_agent_1/continue`,
+    params: continueBody,
+  });
+
+  const continueResponse = await invoke({
+    handler,
+    method: "POST",
+    path: "/api/twilio/voice/voice_agent_1/continue",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      "x-twilio-signature": continueSignature,
+    },
+    body: continueBody,
+  });
+
+  assert.equal(continueResponse.status, 200);
+  assert.ok(continueResponse.text.includes("<Response>"));
+
+  const statusBody = {
+    CallSid: "CAinbound123",
+    CallStatus: "completed",
+    CallDuration: "64",
+    From: "+15551234567",
+  };
+  const statusSignature = buildTwilioTestSignature({
+    authToken: twilioAuthToken,
+    requestUrl: `${twilioBaseUrl}/api/twilio/voice/status`,
+    params: statusBody,
+  });
+
+  const statusResponse = await invoke({
+    handler,
+    method: "POST",
+    path: "/api/twilio/voice/status",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      "x-twilio-signature": statusSignature,
+    },
+    body: statusBody,
+  });
+
+  assert.equal(statusResponse.status, 200);
+  assert.equal(statusResponse.json.finalized, true);
+  assert.equal(statusResponse.json.call.outcome, "FAQ Answered");
+  assert.equal(statusResponse.json.call.callerPhone, "+15551234567");
+  assert.ok(statusResponse.json.call.transcript.some((line) => line.text.includes("office hours")));
+});
+
+test("twilio outbound initiation creates a call and finalizes callbacks into call logs", async (t) => {
+  const twilioRequests = [];
+  const twilioAuthToken = "twilio-test-token";
+  const twilioBaseUrl = "https://agently-server.test";
+  const fetchImpl = async (requestUrl, options) => {
+    twilioRequests.push({
+      requestUrl,
+      options,
+    });
+
+    return {
+      ok: true,
+      status: 201,
+      headers: {
+        get(name) {
+          return name.toLowerCase() === "content-type" ? "application/json" : null;
+        },
+      },
+      async json() {
+        return {
+          sid: "CAoutbound123",
+          status: "queued",
+        };
+      },
+    };
+  };
+
+  const { handler } = await createTestContext(t, {
+    twilio: {
+      webhookBaseUrl: twilioBaseUrl,
+      validateRequests: true,
+      fetchImpl,
+    },
+  });
+
+  const token = "demo-owner-token";
+  const settingsResponse = await invoke({
+    handler,
+    method: "PATCH",
+    path: "/api/settings",
+    token,
+    body: {
+      twilio: {
+        accountSid: "ACworkspace456",
+        authToken: twilioAuthToken,
+        validateRequests: true,
+      },
+    },
+  });
+
+  assert.equal(settingsResponse.status, 200);
+  assert.equal(settingsResponse.json.twilio.accountSid, "ACworkspace456");
+
+  const voiceAgentResponse = await invoke({
+    handler,
+    method: "POST",
+    path: "/api/voice-agents",
+    token,
+    body: {
+      name: "Outbound Maya",
+      direction: "outbound",
+      twilioPhoneNumber: "+18335550110",
+      twilioPhoneSid: "PNoutboundmaya",
+    },
+  });
+
+  assert.equal(voiceAgentResponse.status, 201);
+
+  const launchResponse = await invoke({
+    handler,
+    method: "POST",
+    path: `/api/voice-agents/${voiceAgentResponse.json.id}/outbound-calls`,
+    token,
+    body: {
+      to: "+15557654321",
+      contactName: "Jordan Lee",
+      prompt: "Hi Jordan, we are following up on your demo request.",
+      machineDetection: "DetectMessageEnd",
+    },
+  });
+
+  assert.equal(launchResponse.status, 201);
+  assert.equal(launchResponse.json.callSid, "CAoutbound123");
+  assert.equal(twilioRequests.length, 1);
+  assert.ok(twilioRequests[0].requestUrl.includes("/Calls.json"));
+  assert.ok(String(twilioRequests[0].options.body).includes("To=%2B15557654321"));
+  assert.ok(String(twilioRequests[0].options.body).includes("From=%2B18335550110"));
+
+  const twimlBody = {
+    CallSid: "CAoutbound123",
+    To: "+15557654321",
+    CallStatus: "in-progress",
+  };
+  const twimlSignature = buildTwilioTestSignature({
+    authToken: twilioAuthToken,
+    requestUrl: `${twilioBaseUrl}/api/twilio/voice/${voiceAgentResponse.json.id}/outbound/${launchResponse.json.id}/twiml`,
+    params: twimlBody,
+  });
+
+  const twimlResponse = await invoke({
+    handler,
+    method: "POST",
+    path: `/api/twilio/voice/${voiceAgentResponse.json.id}/outbound/${launchResponse.json.id}/twiml`,
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      "x-twilio-signature": twimlSignature,
+    },
+    body: twimlBody,
+  });
+
+  assert.equal(twimlResponse.status, 200);
+  assert.ok(twimlResponse.text.includes("demo request"));
+
+  const continueBody = {
+    CallSid: "CAoutbound123",
+    To: "+15557654321",
+    CallStatus: "in-progress",
+    SpeechResult: "Please call me back tomorrow. My number is +15557654321.",
+  };
+  const outboundContinueSignature = buildTwilioTestSignature({
+    authToken: twilioAuthToken,
+    requestUrl: `${twilioBaseUrl}/api/twilio/voice/${voiceAgentResponse.json.id}/outbound/${launchResponse.json.id}/continue`,
+    params: continueBody,
+  });
+
+  const continueResponse = await invoke({
+    handler,
+    method: "POST",
+    path: `/api/twilio/voice/${voiceAgentResponse.json.id}/outbound/${launchResponse.json.id}/continue`,
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      "x-twilio-signature": outboundContinueSignature,
+    },
+    body: continueBody,
+  });
+
+  assert.equal(continueResponse.status, 200);
+  assert.ok(continueResponse.text.includes("captured your details"));
+
+  const statusBody = {
+    CallSid: "CAoutbound123",
+    CallStatus: "completed",
+    CallDuration: "91",
+    To: "+15557654321",
+  };
+  const statusSignature = buildTwilioTestSignature({
+    authToken: twilioAuthToken,
+    requestUrl: `${twilioBaseUrl}/api/twilio/voice/status?sessionId=${launchResponse.json.id}&agentId=${voiceAgentResponse.json.id}`,
+    params: statusBody,
+  });
+
+  const statusResponse = await invoke({
+    handler,
+    method: "POST",
+    path: `/api/twilio/voice/status?sessionId=${launchResponse.json.id}&agentId=${voiceAgentResponse.json.id}`,
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      "x-twilio-signature": statusSignature,
+    },
+    body: statusBody,
+  });
+
+  assert.equal(statusResponse.status, 200);
+  assert.equal(statusResponse.json.finalized, true);
+  assert.equal(statusResponse.json.call.outcome, "Lead Captured");
+  assert.ok(statusResponse.json.lead);
+  assert.equal(statusResponse.json.lead.phone, "+15557654321");
 });
