@@ -58,7 +58,7 @@ The server listens on `http://localhost:4000` by default.
 
 ## Vercel Deployment
 
-This project now exposes a Vercel-safe default handler from [src/server.js](/Users/demola/www/Agently-/agently-server/src/server.js#L1731), and [src/index.js](/Users/demola/www/Agently-/agently-server/src/index.js) re-exports that same entrypoint.
+This project now exposes a Vercel-safe default handler from [src/server.js](/Users/demola/www/Agently-/agently-server/src/server.js#L1731). The deployment also includes [api/index.js](/Users/demola/www/Agently-/agently-server/api/index.js) and [api/[...path].js](/Users/demola/www/Agently-/agently-server/api/[...path].js), with [vercel.json](/Users/demola/www/Agently-/agently-server/vercel.json) routing `/` to `/api` and `/health` to `/api/health`.
 
 For production on Vercel, set these environment variables:
 

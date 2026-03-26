@@ -1736,16 +1736,21 @@ export default async function handler(req, res) {
 const isMainModule = process.argv[1] === __filename;
 
 if (isMainModule) {
-  const { server, start } = await createAgentlyServer();
-  await start();
-  console.log(`Agently backend listening on http://${DEFAULT_HOST}:${DEFAULT_PORT}`);
+  void (async () => {
+    const { server, start } = await createAgentlyServer();
+    await start();
+    console.log(`Agently backend listening on http://${DEFAULT_HOST}:${DEFAULT_PORT}`);
 
-  const shutdown = () => {
-    server.close(() => {
-      process.exit(0);
-    });
-  };
+    const shutdown = () => {
+      server.close(() => {
+        process.exit(0);
+      });
+    };
 
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
+  })().catch((error) => {
+    console.error("Failed to start Agently backend:", error);
+    process.exit(1);
+  });
 }
