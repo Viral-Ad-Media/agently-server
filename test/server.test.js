@@ -187,6 +187,73 @@ test("register hydrates an incomplete persisted state before writing", async (t)
   assert.equal(registerResponse.json.user.email, "recovered-owner@example.com");
 });
 
+test("voice agent and chatbot collections support creation and public embed delivery", async (t) => {
+  const { handler } = await createTestContext(t);
+  const token = "demo-owner-token";
+
+  const voiceAgentResponse = await invoke({
+    handler,
+    method: "POST",
+    path: "/api/voice-agents",
+    token,
+    body: {
+      name: "Lucia",
+      language: "Spanish",
+      tone: "Friendly",
+    },
+  });
+
+  assert.equal(voiceAgentResponse.status, 201);
+  assert.equal(voiceAgentResponse.json.name, "Lucia");
+
+  const chatbotResponse = await invoke({
+    handler,
+    method: "POST",
+    path: "/api/chatbots",
+    token,
+    body: {
+      name: "Booking Bot",
+      voiceAgentId: voiceAgentResponse.json.id,
+      accentColor: "#0EA5E9",
+      welcomeMessage: "Hi! I can help visitors book faster.",
+    },
+  });
+
+  assert.equal(chatbotResponse.status, 201);
+  assert.ok(chatbotResponse.json.embedScript.includes("data-chatbot-id"));
+
+  const configResponse = await invoke({
+    handler,
+    method: "GET",
+    path: `/api/public/chatbots/${chatbotResponse.json.id}/config`,
+  });
+
+  assert.equal(configResponse.status, 200);
+  assert.equal(configResponse.json.name, "Booking Bot");
+
+  const publicMessageResponse = await invoke({
+    handler,
+    method: "POST",
+    path: `/api/public/chatbots/${chatbotResponse.json.id}/messages`,
+    body: {
+      message: "What are your hours?",
+    },
+  });
+
+  assert.equal(publicMessageResponse.status, 200);
+  assert.ok(publicMessageResponse.json.assistantMessage.text.includes("Booking Bot"));
+
+  const embedScriptResponse = await invoke({
+    handler,
+    method: "GET",
+    path: "/embed/chatbot.js",
+  });
+
+  assert.equal(embedScriptResponse.status, 200);
+  assert.ok((embedScriptResponse.headers["content-type"] || "").includes("application/javascript"));
+  assert.ok(embedScriptResponse.text.includes("data-chatbot-id"));
+});
+
 test("faq sync, messenger, call simulation, and csv export all respond", async (t) => {
   const { handler } = await createTestContext(t);
   const token = "demo-owner-token";
@@ -216,7 +283,7 @@ test("faq sync, messenger, call simulation, and csv export all respond", async (
   });
   assert.equal(messengerResponse.status, 200);
   const messengerPayload = messengerResponse.json;
-  assert.ok(messengerPayload.assistantMessage.text.includes("Maya"));
+  assert.ok(messengerPayload.assistantMessage.text.includes("Website Concierge"));
 
   const callResponse = await invoke({
     handler,

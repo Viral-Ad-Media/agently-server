@@ -9,8 +9,12 @@ import {
   AGENT_TONES,
   AGENT_VOICES,
   CALL_OUTCOMES,
+  CHATBOT_POSITIONS,
   PLAN_LIMITS,
+  createChatbot,
   createDefaultState,
+  createVoiceAgent,
+  normalizeWorkspaceState,
 } from "./defaults.js";
 import { createStore } from "./store.js";
 
@@ -28,10 +32,13 @@ const PUBLIC_ROUTES = new Set([
   "GET /health",
   "GET /api",
   "GET /api/docs",
+  "GET /embed/chatbot.js",
   "POST /api/auth/login",
   "POST /api/auth/register",
   "POST /api/auth/magic-link",
   "POST /api/auth/magic-link/verify",
+  "GET /api/public/chatbots/:id/config",
+  "POST /api/public/chatbots/:id/messages",
   "POST /api/contact",
   "POST /api/contact-sales",
 ]);
@@ -41,6 +48,7 @@ const ROUTE_DOCS = [
   { method: "GET", path: "/health", auth: false, description: "Simple uptime and health check." },
   { method: "GET", path: "/api", auth: false, description: "Small API landing response with version and docs link." },
   { method: "GET", path: "/api/docs", auth: false, description: "Structured list of every available endpoint." },
+  { method: "GET", path: "/embed/chatbot.js", auth: false, description: "Embeddable widget script for public website chatbot deployments." },
   { method: "POST", path: "/api/auth/login", auth: false, description: "Password login for an existing workspace member." },
   { method: "POST", path: "/api/auth/register", auth: false, description: "Create a new owner session and bootstrap the workspace." },
   { method: "POST", path: "/api/auth/magic-link", auth: false, description: "Create a one-time sign-in link token." },
@@ -55,6 +63,11 @@ const ROUTE_DOCS = [
   { method: "PATCH", path: "/api/settings", auth: true, description: "Update organization settings like timezone or phone number." },
   { method: "POST", path: "/api/onboarding/faqs", auth: true, description: "Generate starter FAQ entries from a website URL." },
   { method: "POST", path: "/api/onboarding/complete", auth: true, description: "Persist onboarding profile and agent configuration." },
+  { method: "GET", path: "/api/voice-agents", auth: true, description: "List all configured voice agents." },
+  { method: "POST", path: "/api/voice-agents", auth: true, description: "Create a new voice agent." },
+  { method: "PATCH", path: "/api/voice-agents/:id", auth: true, description: "Update a specific voice agent." },
+  { method: "DELETE", path: "/api/voice-agents/:id", auth: true, description: "Delete a non-last voice agent." },
+  { method: "POST", path: "/api/voice-agents/:id/activate", auth: true, description: "Set the active voice agent used across the workspace." },
   { method: "GET", path: "/api/agent", auth: true, description: "Return the current agent configuration." },
   { method: "PATCH", path: "/api/agent", auth: true, description: "Update agent configuration and nested rules." },
   { method: "GET", path: "/api/agent/faqs", auth: true, description: "Return the agent FAQ list." },
@@ -63,9 +76,17 @@ const ROUTE_DOCS = [
   { method: "DELETE", path: "/api/agent/faqs/:id", auth: true, description: "Delete a single FAQ entry." },
   { method: "POST", path: "/api/agent/faqs/sync", auth: true, description: "Regenerate FAQs from the organization website and replace the list." },
   { method: "POST", path: "/api/agent/restart", auth: true, description: "Record a restart event for the agent." },
+  { method: "GET", path: "/api/chatbots", auth: true, description: "List all configured chatbots and their embed snippets." },
+  { method: "POST", path: "/api/chatbots", auth: true, description: "Create a new customizable chatbot." },
+  { method: "PATCH", path: "/api/chatbots/:id", auth: true, description: "Update chatbot appearance, behavior, or linked voice agent." },
+  { method: "DELETE", path: "/api/chatbots/:id", auth: true, description: "Delete a non-last chatbot." },
+  { method: "POST", path: "/api/chatbots/:id/activate", auth: true, description: "Set the active chatbot used in the workspace preview." },
+  { method: "GET", path: "/api/chatbots/:id/embed", auth: true, description: "Return the embeddable script snippet for a chatbot." },
   { method: "GET", path: "/api/messenger/messages", auth: true, description: "Return the current messenger thread." },
   { method: "POST", path: "/api/messenger/messages", auth: true, description: "Append a user message and generate an agent reply." },
   { method: "DELETE", path: "/api/messenger/messages", auth: true, description: "Reset the messenger thread back to the greeting state." },
+  { method: "GET", path: "/api/public/chatbots/:id/config", auth: false, description: "Return public widget configuration for a chatbot." },
+  { method: "POST", path: "/api/public/chatbots/:id/messages", auth: false, description: "Generate a public widget reply for an embedded chatbot." },
   { method: "GET", path: "/api/calls", auth: true, description: "List calls with search and outcome filters." },
   { method: "POST", path: "/api/calls/simulate", auth: true, description: "Create a simulated call, summary, and optional lead." },
   { method: "GET", path: "/api/calls/:id", auth: true, description: "Return a single call record." },
@@ -103,8 +124,14 @@ class HttpError extends Error {
 
 const nowIso = () => new Date().toISOString();
 
+const getCorsOrigin = (pathname = "") => (
+  pathname.startsWith("/api/public/") || pathname.startsWith("/embed/")
+    ? "*"
+    : ALLOWED_ORIGIN
+);
+
 const setCorsHeaders = (res) => {
-  res.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
+  res.setHeader("Access-Control-Allow-Origin", getCorsOrigin(res.__corsPathname || ""));
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,PUT,DELETE,OPTIONS");
 };
@@ -122,6 +149,14 @@ const sendText = (res, statusCode, text, headers = {}) => {
     ...headers,
   });
   res.end(text);
+};
+
+const sendScript = (res, statusCode, script) => {
+  setCorsHeaders(res);
+  res.writeHead(statusCode, {
+    "Content-Type": "application/javascript; charset=utf-8",
+  });
+  res.end(script);
 };
 
 const sendCsv = (res, filename, content) => {
@@ -288,9 +323,106 @@ const normalizeWebsite = (website) => {
   return input.replace(/^https?:\/\//i, "");
 };
 
+const applyWorkspaceNormalization = (state) => {
+  const normalized = normalizeWorkspaceState(state);
+  for (const key of Object.keys(state)) {
+    delete state[key];
+  }
+  Object.assign(state, normalized);
+  return state;
+};
+
+const getPublicBaseUrl = (req) => {
+  const forwardedProto = typeof req.headers["x-forwarded-proto"] === "string"
+    ? req.headers["x-forwarded-proto"].split(",")[0].trim()
+    : "";
+  const protocol = forwardedProto || (process.env.VERCEL ? "https" : "http");
+  const forwardedHost = typeof req.headers["x-forwarded-host"] === "string"
+    ? req.headers["x-forwarded-host"].split(",")[0].trim()
+    : "";
+  const host = forwardedHost || req.headers.host || `localhost:${DEFAULT_PORT}`;
+  return `${protocol}://${host}`;
+};
+
 const findCallById = (state, id) => state.calls.find((call) => call.id === id) || null;
 const findLeadById = (state, id) => state.leads.find((lead) => lead.id === id) || null;
 const findInvoiceById = (state, id) => state.organization.invoices.find((invoice) => invoice.id === id) || null;
+const findVoiceAgentById = (state, id) => state.organization.voiceAgents.find((agent) => agent.id === id) || null;
+const findChatbotById = (state, id) => state.organization.chatbots.find((chatbot) => chatbot.id === id) || null;
+const getActiveVoiceAgent = (state) => findVoiceAgentById(state, state.organization.activeVoiceAgentId) || state.organization.voiceAgents[0];
+const getActiveChatbot = (state) => findChatbotById(state, state.organization.activeChatbotId) || state.organization.chatbots[0];
+const getVoiceAgentForChatbot = (state, chatbot = getActiveChatbot(state)) => (
+  findVoiceAgentById(state, chatbot.voiceAgentId) || getActiveVoiceAgent(state)
+);
+
+const toAvatarLabel = (value) => (
+  (value || "AG")
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part.charAt(0).toUpperCase())
+    .join("") || "AG"
+);
+
+const buildEmbedScriptTag = (req, chatbot) => (
+  `<script src="${getPublicBaseUrl(req)}/embed/chatbot.js" data-chatbot-id="${chatbot.id}" defer></script>`
+);
+
+const serializeChatbot = (req, chatbot) => ({
+  ...chatbot,
+  embedScript: buildEmbedScriptTag(req, chatbot),
+  widgetScriptUrl: `${getPublicBaseUrl(req)}/embed/chatbot.js`,
+});
+
+const serializeOrganization = (req, organization) => ({
+  ...organization,
+  chatbots: organization.chatbots.map((chatbot) => serializeChatbot(req, chatbot)),
+});
+
+const buildVoiceAgentTemplate = (state) => {
+  const current = getActiveVoiceAgent(state);
+  const index = state.organization.voiceAgents.length + 1;
+  return createVoiceAgent({
+    ...current,
+    id: uniqueId("voice_agent"),
+    name: `Voice Agent ${index}`,
+    greeting: `Hello, thank you for calling ${state.organization.profile.name}. This is Voice Agent ${index}. How can I help you today?`,
+    faqs: current.faqs.map((faq) => ({ ...faq, id: uniqueId("faq") })),
+  });
+};
+
+const buildChatbotTemplate = (state) => {
+  const activeAgent = getActiveVoiceAgent(state);
+  const index = state.organization.chatbots.length + 1;
+  return createChatbot({
+    id: uniqueId("chatbot"),
+    voiceAgentId: activeAgent.id,
+    name: `Chatbot ${index}`,
+    headerTitle: `${state.organization.profile.name} Assistant`,
+    welcomeMessage: `Hi! I'm ${activeAgent.name}'s website assistant for ${state.organization.profile.name}. Ask me anything and I can guide you from here.`,
+    launcherLabel: "Need help?",
+    avatarLabel: toAvatarLabel(state.organization.profile.name),
+    suggestedPrompts: [
+      "What services do you offer?",
+      "Can I book an appointment?",
+      "What are your hours?",
+    ],
+  });
+};
+
+const replaceVoiceAgentById = (state, agentId, nextAgent) => {
+  const index = state.organization.voiceAgents.findIndex((agent) => agent.id === agentId);
+  if (index === -1) {
+    throw new HttpError(404, "Voice agent not found.");
+  }
+
+  state.organization.voiceAgents[index] = {
+    ...nextAgent,
+    id: agentId,
+  };
+  state.organization.agent = state.organization.voiceAgents[index];
+  return state.organization.agent;
+};
 
 const csvEscape = (value) => {
   const stringValue = String(value ?? "");
@@ -576,46 +708,53 @@ const buildCallFromSimulation = ({ transcript, callerName, callerPhone, duration
   };
 };
 
-const getConversation = (state) => {
+const getConversation = (state, chatbotId = state.organization.activeChatbotId) => {
+  const chatbot = findChatbotById(state, chatbotId) || getActiveChatbot(state);
   const greeting = {
-    id: "msg_greeting",
+    id: `msg_greeting_${chatbot.id}`,
     role: "model",
-    text: state.organization.agent.greeting,
+    text: chatbot.welcomeMessage,
     timestamp: nowIso(),
   };
 
-  const conversation = state.conversations.default;
+  const conversation = state.conversations.byChatbotId?.[chatbot.id] || state.conversations.default || [];
   return conversation.length > 0 ? conversation : [greeting];
 };
 
-const findFaqResponse = (message, state) => {
+const findFaqResponse = (message, state, chatbotId = state.organization.activeChatbotId) => {
   const normalized = message.toLowerCase();
-  const { profile, agent } = state.organization;
+  const profile = state.organization.profile;
+  const chatbot = findChatbotById(state, chatbotId) || getActiveChatbot(state);
+  const agent = getVoiceAgentForChatbot(state, chatbot);
 
   if (normalized.includes("hour")) {
-    return `${agent.name}: We are available during ${agent.businessHours}.`;
+    return `${chatbot.name}: We are available during ${agent.businessHours}.`;
   }
   if (normalized.includes("where") || normalized.includes("location")) {
-    return `${agent.name}: We are based in ${profile.location}.`;
+    return `${chatbot.name}: We are based in ${profile.location}.`;
   }
   if (normalized.includes("human") || normalized.includes("transfer") || normalized.includes("person")) {
-    return `${agent.name}: I can escalate this to our team at ${agent.escalationPhone}.`;
+    return `${chatbot.name}: I can escalate this to our team at ${agent.escalationPhone}.`;
   }
   if (normalized.includes("appointment") || normalized.includes("book") || normalized.includes("schedule")) {
-    return `${agent.name}: I can help with that. Please share your name, phone number, and preferred time so the team can confirm the appointment.`;
+    return `${chatbot.name}: I can help with that. Please share your name, phone number, and preferred time so the team can confirm the appointment.`;
   }
 
   for (const faq of agent.faqs) {
     const questionWords = faq.question.toLowerCase().split(/[^a-z0-9]+/).filter((word) => word.length > 3);
     if (questionWords.some((word) => normalized.includes(word))) {
-      return `${agent.name}: ${faq.answer}`;
+      return `${chatbot.name}: ${faq.answer}`;
     }
   }
 
+  if (chatbot.customPrompt) {
+    return `${chatbot.name}: ${chatbot.customPrompt}`;
+  }
+
   const toneFallbacks = {
-    Professional: `${agent.name}: I can help with that. Please share a few more details and I will capture the request for the team.`,
-    Friendly: `${agent.name}: Happy to help! Share a bit more detail and I will make sure the team gets everything they need.`,
-    Empathetic: `${agent.name}: I’m here to help. Tell me a little more and I’ll make sure your message is handled with care.`,
+    Professional: `${chatbot.name}: I can help with that. Please share a few more details and I will capture the request for the team.`,
+    Friendly: `${chatbot.name}: Happy to help! Share a bit more detail and I will make sure the team gets everything they need.`,
+    Empathetic: `${chatbot.name}: I’m here to help. Tell me a little more and I’ll make sure your message is handled with care.`,
   };
 
   return toneFallbacks[agent.tone] || toneFallbacks.Professional;
@@ -667,6 +806,55 @@ const sanitizeAgentPatch = (body, currentAgent) => {
   return nextAgent;
 };
 
+const sanitizeChatbotPatch = (body, currentChatbot, state) => {
+  const nextChatbot = { ...currentChatbot };
+
+  if ("name" in body) {
+    nextChatbot.name = assertString(body.name, "chatbot.name", { maxLength: 120 });
+  }
+  if ("voiceAgentId" in body) {
+    const voiceAgentId = assertString(body.voiceAgentId, "chatbot.voiceAgentId", { maxLength: 120 });
+    if (!findVoiceAgentById(state, voiceAgentId)) {
+      throw new HttpError(404, "Linked voice agent not found.");
+    }
+    nextChatbot.voiceAgentId = voiceAgentId;
+  }
+  if ("headerTitle" in body) {
+    nextChatbot.headerTitle = assertString(body.headerTitle, "chatbot.headerTitle", { maxLength: 120 });
+  }
+  if ("welcomeMessage" in body) {
+    nextChatbot.welcomeMessage = assertString(body.welcomeMessage, "chatbot.welcomeMessage", { maxLength: 600 });
+  }
+  if ("placeholder" in body) {
+    nextChatbot.placeholder = assertString(body.placeholder, "chatbot.placeholder", { maxLength: 120 });
+  }
+  if ("launcherLabel" in body) {
+    nextChatbot.launcherLabel = assertString(body.launcherLabel, "chatbot.launcherLabel", { maxLength: 80 });
+  }
+  if ("accentColor" in body) {
+    nextChatbot.accentColor = assertString(body.accentColor, "chatbot.accentColor", { maxLength: 20 });
+  }
+  if ("position" in body) {
+    nextChatbot.position = assertEnum(body.position, CHATBOT_POSITIONS, "chatbot.position");
+  }
+  if ("avatarLabel" in body) {
+    nextChatbot.avatarLabel = assertString(body.avatarLabel, "chatbot.avatarLabel", { maxLength: 6 });
+  }
+  if ("customPrompt" in body) {
+    nextChatbot.customPrompt = assertString(body.customPrompt, "chatbot.customPrompt", { maxLength: 500 });
+  }
+  if ("suggestedPrompts" in body) {
+    if (!Array.isArray(body.suggestedPrompts)) {
+      throw new HttpError(400, "chatbot.suggestedPrompts must be an array.");
+    }
+    nextChatbot.suggestedPrompts = body.suggestedPrompts
+      .slice(0, 4)
+      .map((prompt) => assertString(prompt, "chatbot.suggestedPrompts[]", { maxLength: 120 }));
+  }
+
+  return nextChatbot;
+};
+
 const createInvoice = (plan) => ({
   id: uniqueId("inv"),
   date: nowIso(),
@@ -686,14 +874,244 @@ const appendAuditEvent = (state, action, actorId, details = {}) => {
   state.auditLog = state.auditLog.slice(0, 100);
 };
 
-const buildBootstrapPayload = (state, user) => ({
+const buildBootstrapPayload = (req, state, user) => ({
   user,
-  organization: state.organization,
+  organization: serializeOrganization(req, state.organization),
   leads: state.leads,
   calls: state.calls,
   conversation: getConversation(state),
   dashboard: buildDashboard(state),
 });
+
+const buildWidgetScript = (baseUrl) => `(() => {
+  const currentScript = document.currentScript || Array.from(document.scripts).find((script) => script.src && script.src.indexOf("/embed/chatbot.js") !== -1);
+  if (!currentScript) return;
+
+  const chatbotId = currentScript.dataset.chatbotId || new URL(currentScript.src).searchParams.get("chatbotId");
+  if (!chatbotId) {
+    console.warn("Agently widget requires data-chatbot-id or chatbotId query parameter.");
+    return;
+  }
+
+  const apiBase = ${JSON.stringify(baseUrl)};
+  const state = {
+    config: null,
+    isOpen: false,
+    isSending: false,
+    button: null,
+    panel: null,
+    body: null,
+    input: null,
+    sendButton: null,
+  };
+
+  const createNode = (tag, styles = {}, text) => {
+    const node = document.createElement(tag);
+    Object.assign(node.style, styles);
+    if (text) node.textContent = text;
+    return node;
+  };
+
+  const appendMessage = (role, text) => {
+    if (!state.body) return;
+    const row = createNode("div", {
+      display: "flex",
+      justifyContent: role === "user" ? "flex-end" : "flex-start",
+      marginBottom: "10px",
+    });
+    const bubble = createNode("div", {
+      maxWidth: "80%",
+      padding: "12px 14px",
+      borderRadius: "16px",
+      fontSize: "14px",
+      lineHeight: "1.5",
+      whiteSpace: "pre-wrap",
+      background: role === "user" ? (state.config?.accentColor || "#4F46E5") : "#FFFFFF",
+      color: role === "user" ? "#FFFFFF" : "#0F172A",
+      border: role === "user" ? "none" : "1px solid #E2E8F0",
+      boxShadow: "0 8px 24px rgba(15, 23, 42, 0.08)",
+    }, text);
+    row.appendChild(bubble);
+    state.body.appendChild(row);
+    state.body.scrollTop = state.body.scrollHeight;
+  };
+
+  const setSending = (sending) => {
+    state.isSending = sending;
+    if (state.sendButton) state.sendButton.disabled = sending;
+    if (state.input) state.input.disabled = sending;
+  };
+
+  const sendMessage = async () => {
+    if (!state.input || state.isSending) return;
+    const message = state.input.value.trim();
+    if (!message) return;
+
+    appendMessage("user", message);
+    state.input.value = "";
+    setSending(true);
+
+    try {
+      const response = await fetch(apiBase + "/api/public/chatbots/" + encodeURIComponent(chatbotId) + "/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message }),
+      });
+
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload?.error?.message || "Unable to reach chatbot.");
+      }
+
+      appendMessage("model", payload.assistantMessage.text);
+    } catch (error) {
+      appendMessage("model", error instanceof Error ? error.message : "Unable to reach chatbot right now.");
+    } finally {
+      setSending(false);
+      if (state.input) state.input.focus();
+    }
+  };
+
+  const togglePanel = () => {
+    state.isOpen = !state.isOpen;
+    if (state.panel) state.panel.style.display = state.isOpen ? "flex" : "none";
+    if (state.button) state.button.textContent = state.isOpen ? "Close" : (state.config?.launcherLabel || "Chat");
+  };
+
+  const mountWidget = () => {
+    if (state.button || !state.config) return;
+    const positionRight = state.config.position !== "left";
+    const wrapper = createNode("div", {
+      position: "fixed",
+      bottom: "24px",
+      [positionRight ? "right" : "left"]: "24px",
+      zIndex: "2147483647",
+      fontFamily: "Inter, Arial, sans-serif",
+    });
+
+    state.panel = createNode("div", {
+      width: "360px",
+      maxWidth: "calc(100vw - 32px)",
+      height: "540px",
+      display: "none",
+      flexDirection: "column",
+      overflow: "hidden",
+      borderRadius: "24px",
+      background: "#F8FAFC",
+      border: "1px solid #E2E8F0",
+      boxShadow: "0 24px 80px rgba(15, 23, 42, 0.24)",
+      marginBottom: "12px",
+    });
+
+    const header = createNode("div", {
+      padding: "18px 20px",
+      background: state.config.accentColor,
+      color: "#FFFFFF",
+      display: "flex",
+      alignItems: "center",
+      gap: "12px",
+    });
+    const avatar = createNode("div", {
+      width: "42px",
+      height: "42px",
+      borderRadius: "14px",
+      background: "rgba(255,255,255,0.18)",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      fontWeight: "700",
+      letterSpacing: "0.08em",
+      fontSize: "14px",
+    }, state.config.avatarLabel || "AG");
+    const titleWrap = createNode("div");
+    titleWrap.appendChild(createNode("div", { fontSize: "16px", fontWeight: "800" }, state.config.headerTitle));
+    titleWrap.appendChild(createNode("div", { fontSize: "11px", opacity: "0.8", textTransform: "uppercase", letterSpacing: "0.14em" }, "Embedded chatbot"));
+    header.appendChild(avatar);
+    header.appendChild(titleWrap);
+
+    state.body = createNode("div", {
+      flex: "1",
+      overflowY: "auto",
+      padding: "18px",
+      background: "#F8FAFC",
+    });
+
+    const composer = createNode("div", {
+      display: "flex",
+      gap: "10px",
+      padding: "16px",
+      borderTop: "1px solid #E2E8F0",
+      background: "#FFFFFF",
+    });
+
+    state.input = createNode("input", {
+      flex: "1",
+      border: "1px solid #CBD5E1",
+      borderRadius: "14px",
+      padding: "12px 14px",
+      fontSize: "14px",
+      outline: "none",
+    });
+    state.input.placeholder = state.config.placeholder;
+    state.input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        void sendMessage();
+      }
+    });
+
+    state.sendButton = createNode("button", {
+      border: "none",
+      borderRadius: "14px",
+      padding: "0 16px",
+      cursor: "pointer",
+      background: state.config.accentColor,
+      color: "#FFFFFF",
+      fontWeight: "700",
+    }, "Send");
+    state.sendButton.addEventListener("click", () => {
+      void sendMessage();
+    });
+
+    composer.appendChild(state.input);
+    composer.appendChild(state.sendButton);
+
+    state.panel.appendChild(header);
+    state.panel.appendChild(state.body);
+    state.panel.appendChild(composer);
+
+    state.button = createNode("button", {
+      border: "none",
+      borderRadius: "999px",
+      padding: "14px 18px",
+      cursor: "pointer",
+      background: state.config.accentColor,
+      color: "#FFFFFF",
+      fontWeight: "800",
+      boxShadow: "0 20px 40px rgba(15, 23, 42, 0.22)",
+    }, state.config.launcherLabel || "Chat");
+    state.button.addEventListener("click", togglePanel);
+
+    wrapper.appendChild(state.panel);
+    wrapper.appendChild(state.button);
+    document.body.appendChild(wrapper);
+
+    appendMessage("model", state.config.welcomeMessage);
+  };
+
+  fetch(apiBase + "/api/public/chatbots/" + encodeURIComponent(chatbotId) + "/config")
+    .then((response) => response.json().then((payload) => ({ ok: response.ok, payload })))
+    .then(({ ok, payload }) => {
+      if (!ok) {
+        throw new Error(payload?.error?.message || "Unable to load chatbot.");
+      }
+      state.config = payload;
+      mountWidget();
+    })
+    .catch((error) => {
+      console.error("Agently widget failed to initialize:", error);
+    });
+})();`;
 
 const route = async (req, res, url, store, routeKey, params) => {
   const snapshot = await store.read();
@@ -724,13 +1142,17 @@ const route = async (req, res, url, store, routeKey, params) => {
     return sendJson(res, 200, {
       service: "Agently Backend API",
       storeProvider: store.mode,
-      baseUrl: `http://${req.headers.host || `localhost:${DEFAULT_PORT}`}`,
+      baseUrl: getPublicBaseUrl(req),
       auth: {
         type: "Bearer",
         seedToken: "demo-owner-token",
       },
       routes: ROUTE_DOCS,
     });
+  }
+
+  if (routeKey === "GET /embed/chatbot.js") {
+    return sendScript(res, 200, buildWidgetScript(getPublicBaseUrl(req)));
   }
 
   if (routeKey === "POST /api/auth/login") {
@@ -770,7 +1192,10 @@ const route = async (req, res, url, store, routeKey, params) => {
       };
     });
 
-    return sendJson(res, 200, result);
+    return sendJson(res, 200, {
+      ...result,
+      organization: serializeOrganization(req, result.organization),
+    });
   }
 
   if (routeKey === "POST /api/auth/register") {
@@ -790,6 +1215,13 @@ const route = async (req, res, url, store, routeKey, params) => {
       draft.organization.profile.name = companyName;
       draft.organization.members = [owner];
       draft.currentUserId = owner.id;
+      draft.organization.agent.greeting = `Hello, thank you for calling ${companyName}. This is ${draft.organization.agent.name}. How can I assist you today?`;
+
+      const activeChatbot = getActiveChatbot(draft);
+      if (activeChatbot) {
+        activeChatbot.headerTitle = `${companyName} Assistant`;
+        activeChatbot.welcomeMessage = `Hi there! I'm here to help visitors learn more about ${companyName} and get connected with your team.`;
+      }
 
       const token = uniqueId("token");
       draft.auth.sessions.push({
@@ -807,7 +1239,10 @@ const route = async (req, res, url, store, routeKey, params) => {
       };
     });
 
-    return sendJson(res, 201, result);
+    return sendJson(res, 201, {
+      ...result,
+      organization: serializeOrganization(req, result.organization),
+    });
   }
 
   if (routeKey === "POST /api/auth/magic-link") {
@@ -895,7 +1330,7 @@ const route = async (req, res, url, store, routeKey, params) => {
   }
 
   if (routeKey === "GET /api/bootstrap") {
-    return sendJson(res, 200, buildBootstrapPayload(snapshot, user));
+    return sendJson(res, 200, buildBootstrapPayload(req, snapshot, user));
   }
 
   if (routeKey === "GET /api/dashboard") {
@@ -903,7 +1338,7 @@ const route = async (req, res, url, store, routeKey, params) => {
   }
 
   if (routeKey === "GET /api/organization") {
-    return sendJson(res, 200, snapshot.organization);
+    return sendJson(res, 200, serializeOrganization(req, snapshot.organization));
   }
 
   if (routeKey === "PATCH /api/organization/profile") {
@@ -986,7 +1421,7 @@ const route = async (req, res, url, store, routeKey, params) => {
         timezone: assertString(profile.timezone || draft.organization.profile.timezone, "profile.timezone"),
       };
 
-      draft.organization.agent = sanitizeAgentPatch(agent, {
+      const nextAgent = sanitizeAgentPatch(agent, {
         ...draft.organization.agent,
         faqs: Array.isArray(agent.faqs) && agent.faqs.length > 0
           ? agent.faqs.map((faq) => ({
@@ -996,6 +1431,7 @@ const route = async (req, res, url, store, routeKey, params) => {
           }))
           : draft.organization.agent.faqs,
       });
+      replaceVoiceAgentById(draft, draft.organization.activeVoiceAgentId, nextAgent);
 
       appendAuditEvent(draft, "onboarding.complete", user.id, {
         organizationName: draft.organization.profile.name,
@@ -1007,13 +1443,191 @@ const route = async (req, res, url, store, routeKey, params) => {
     return sendJson(res, 200, organization);
   }
 
+  if (routeKey === "GET /api/voice-agents") {
+    return sendJson(res, 200, {
+      items: snapshot.organization.voiceAgents,
+      activeVoiceAgentId: snapshot.organization.activeVoiceAgentId,
+    });
+  }
+
+  if (routeKey === "POST /api/voice-agents") {
+    const voiceAgent = await store.update((draft) => {
+      const nextAgent = buildVoiceAgentTemplate(draft);
+      const patch = assertObject(body || {}, "voiceAgent");
+      const sanitized = sanitizeAgentPatch(patch, nextAgent);
+
+      if (Array.isArray(patch.faqs) && patch.faqs.length > 0) {
+        sanitized.faqs = patch.faqs.map((faq) => ({
+          id: assertString(faq.id || uniqueId("faq"), "voiceAgent.faqs[].id", { required: false, maxLength: 100 }) || uniqueId("faq"),
+          question: assertString(faq.question, "voiceAgent.faqs[].question"),
+          answer: assertString(faq.answer, "voiceAgent.faqs[].answer"),
+        }));
+      }
+
+      draft.organization.voiceAgents.push(sanitized);
+      draft.organization.activeVoiceAgentId = sanitized.id;
+      appendAuditEvent(draft, "voice_agent.create", user.id, { voiceAgentId: sanitized.id });
+      return sanitized;
+    });
+
+    return sendJson(res, 201, voiceAgent);
+  }
+
+  if (routeKey === "PATCH /api/voice-agents/:id") {
+    const voiceAgent = await store.update((draft) => {
+      const existingAgent = findVoiceAgentById(draft, params.id);
+      if (!existingAgent) {
+        throw new HttpError(404, "Voice agent not found.");
+      }
+
+      const patch = assertObject(body, "voiceAgent");
+      const sanitized = sanitizeAgentPatch(patch, existingAgent);
+      Object.assign(existingAgent, sanitized);
+      appendAuditEvent(draft, "voice_agent.update", user.id, { voiceAgentId: existingAgent.id });
+      return existingAgent;
+    });
+
+    return sendJson(res, 200, voiceAgent);
+  }
+
+  if (routeKey === "DELETE /api/voice-agents/:id") {
+    await store.update((draft) => {
+      if (draft.organization.voiceAgents.length <= 1) {
+        throw new HttpError(400, "At least one voice agent must remain.");
+      }
+
+      const exists = findVoiceAgentById(draft, params.id);
+      if (!exists) {
+        throw new HttpError(404, "Voice agent not found.");
+      }
+
+      draft.organization.voiceAgents = draft.organization.voiceAgents.filter((agent) => agent.id !== params.id);
+      const fallbackAgent = draft.organization.voiceAgents[0];
+      if (draft.organization.activeVoiceAgentId === params.id) {
+        draft.organization.activeVoiceAgentId = fallbackAgent.id;
+      }
+      for (const chatbot of draft.organization.chatbots) {
+        if (chatbot.voiceAgentId === params.id) {
+          chatbot.voiceAgentId = fallbackAgent.id;
+        }
+      }
+
+      appendAuditEvent(draft, "voice_agent.delete", user.id, { voiceAgentId: params.id });
+    });
+
+    return sendJson(res, 200, { success: true });
+  }
+
+  if (routeKey === "POST /api/voice-agents/:id/activate") {
+    const activeVoiceAgent = await store.update((draft) => {
+      const existingAgent = findVoiceAgentById(draft, params.id);
+      if (!existingAgent) {
+        throw new HttpError(404, "Voice agent not found.");
+      }
+
+      draft.organization.activeVoiceAgentId = existingAgent.id;
+      appendAuditEvent(draft, "voice_agent.activate", user.id, { voiceAgentId: existingAgent.id });
+      return existingAgent;
+    });
+
+    return sendJson(res, 200, activeVoiceAgent);
+  }
+
+  if (routeKey === "GET /api/chatbots") {
+    return sendJson(res, 200, {
+      items: snapshot.organization.chatbots.map((chatbot) => serializeChatbot(req, chatbot)),
+      activeChatbotId: snapshot.organization.activeChatbotId,
+    });
+  }
+
+  if (routeKey === "POST /api/chatbots") {
+    const chatbot = await store.update((draft) => {
+      const nextChatbot = buildChatbotTemplate(draft);
+      const patch = assertObject(body || {}, "chatbot");
+      const sanitized = sanitizeChatbotPatch(patch, nextChatbot, draft);
+      draft.organization.chatbots.push(sanitized);
+      draft.organization.activeChatbotId = sanitized.id;
+      draft.conversations.byChatbotId[sanitized.id] = [];
+      appendAuditEvent(draft, "chatbot.create", user.id, { chatbotId: sanitized.id });
+      return sanitized;
+    });
+
+    return sendJson(res, 201, serializeChatbot(req, chatbot));
+  }
+
+  if (routeKey === "PATCH /api/chatbots/:id") {
+    const chatbot = await store.update((draft) => {
+      const existingChatbot = findChatbotById(draft, params.id);
+      if (!existingChatbot) {
+        throw new HttpError(404, "Chatbot not found.");
+      }
+
+      const sanitized = sanitizeChatbotPatch(assertObject(body, "chatbot"), existingChatbot, draft);
+      Object.assign(existingChatbot, sanitized);
+      appendAuditEvent(draft, "chatbot.update", user.id, { chatbotId: existingChatbot.id });
+      return existingChatbot;
+    });
+
+    return sendJson(res, 200, serializeChatbot(req, chatbot));
+  }
+
+  if (routeKey === "DELETE /api/chatbots/:id") {
+    await store.update((draft) => {
+      if (draft.organization.chatbots.length <= 1) {
+        throw new HttpError(400, "At least one chatbot must remain.");
+      }
+
+      const exists = findChatbotById(draft, params.id);
+      if (!exists) {
+        throw new HttpError(404, "Chatbot not found.");
+      }
+
+      draft.organization.chatbots = draft.organization.chatbots.filter((chatbot) => chatbot.id !== params.id);
+      delete draft.conversations.byChatbotId[params.id];
+      if (draft.organization.activeChatbotId === params.id) {
+        draft.organization.activeChatbotId = draft.organization.chatbots[0].id;
+      }
+      appendAuditEvent(draft, "chatbot.delete", user.id, { chatbotId: params.id });
+    });
+
+    return sendJson(res, 200, { success: true });
+  }
+
+  if (routeKey === "POST /api/chatbots/:id/activate") {
+    const activeChatbot = await store.update((draft) => {
+      const existingChatbot = findChatbotById(draft, params.id);
+      if (!existingChatbot) {
+        throw new HttpError(404, "Chatbot not found.");
+      }
+
+      draft.organization.activeChatbotId = existingChatbot.id;
+      appendAuditEvent(draft, "chatbot.activate", user.id, { chatbotId: existingChatbot.id });
+      return existingChatbot;
+    });
+
+    return sendJson(res, 200, serializeChatbot(req, activeChatbot));
+  }
+
+  if (routeKey === "GET /api/chatbots/:id/embed") {
+    const chatbot = findChatbotById(snapshot, params.id);
+    if (!chatbot) {
+      throw new HttpError(404, "Chatbot not found.");
+    }
+
+    return sendJson(res, 200, {
+      chatbot: serializeChatbot(req, chatbot),
+      script: buildEmbedScriptTag(req, chatbot),
+    });
+  }
+
   if (routeKey === "GET /api/agent") {
     return sendJson(res, 200, snapshot.organization.agent);
   }
 
   if (routeKey === "PATCH /api/agent") {
     const nextAgent = await store.update((draft) => {
-      draft.organization.agent = sanitizeAgentPatch(assertObject(body, "agent"), draft.organization.agent);
+      const updatedAgent = sanitizeAgentPatch(assertObject(body, "agent"), draft.organization.agent);
+      replaceVoiceAgentById(draft, draft.organization.activeVoiceAgentId, updatedAgent);
       appendAuditEvent(draft, "agent.update", user.id, body);
       return draft.organization.agent;
     });
@@ -1101,15 +1715,25 @@ const route = async (req, res, url, store, routeKey, params) => {
   }
 
   if (routeKey === "GET /api/messenger/messages") {
-    return sendJson(res, 200, getConversation(snapshot));
+    const chatbotId = url.searchParams.get("chatbotId") || snapshot.organization.activeChatbotId;
+    const chatbot = findChatbotById(snapshot, chatbotId);
+    if (!chatbot) {
+      throw new HttpError(404, "Chatbot not found.");
+    }
+
+    return sendJson(res, 200, getConversation(snapshot, chatbot.id));
   }
 
   if (routeKey === "POST /api/messenger/messages") {
     const message = assertString(body.message, "message");
+    const chatbotId = assertString(body.chatbotId || url.searchParams.get("chatbotId") || snapshot.organization.activeChatbotId, "chatbotId");
+    if (!findChatbotById(snapshot, chatbotId)) {
+      throw new HttpError(404, "Chatbot not found.");
+    }
 
     const response = await store.update((draft) => {
-      const thread = getConversation(draft);
-      draft.conversations.default = [...thread];
+      const thread = getConversation(draft, chatbotId);
+      draft.conversations.byChatbotId[chatbotId] = [...thread];
 
       const userMessage = {
         id: uniqueId("msg"),
@@ -1120,17 +1744,17 @@ const route = async (req, res, url, store, routeKey, params) => {
       const assistantMessage = {
         id: uniqueId("msg"),
         role: "model",
-        text: findFaqResponse(message, draft),
+        text: findFaqResponse(message, draft, chatbotId),
         timestamp: nowIso(),
       };
 
-      draft.conversations.default.push(userMessage, assistantMessage);
-      appendAuditEvent(draft, "messenger.message", user.id, { message });
+      draft.conversations.byChatbotId[chatbotId].push(userMessage, assistantMessage);
+      appendAuditEvent(draft, "messenger.message", user.id, { message, chatbotId });
 
       return {
         userMessage,
         assistantMessage,
-        conversation: draft.conversations.default,
+        conversation: draft.conversations.byChatbotId[chatbotId],
       };
     });
 
@@ -1138,21 +1762,70 @@ const route = async (req, res, url, store, routeKey, params) => {
   }
 
   if (routeKey === "DELETE /api/messenger/messages") {
+    const chatbotId = body.chatbotId || url.searchParams.get("chatbotId") || snapshot.organization.activeChatbotId;
+    const chatbot = findChatbotById(snapshot, chatbotId);
+    if (!chatbot) {
+      throw new HttpError(404, "Chatbot not found.");
+    }
+
     await store.update((draft) => {
-      draft.conversations.default = [];
-      appendAuditEvent(draft, "messenger.reset", user.id);
+      draft.conversations.byChatbotId[chatbotId] = [];
+      appendAuditEvent(draft, "messenger.reset", user.id, { chatbotId });
     });
 
     return sendJson(res, 200, {
       success: true,
       conversation: [
         {
-          id: "msg_greeting",
+          id: `msg_greeting_${chatbot.id}`,
           role: "model",
-          text: snapshot.organization.agent.greeting,
+          text: chatbot.welcomeMessage,
           timestamp: nowIso(),
         },
       ],
+    });
+  }
+
+  if (routeKey === "GET /api/public/chatbots/:id/config") {
+    const chatbot = findChatbotById(snapshot, params.id);
+    if (!chatbot) {
+      throw new HttpError(404, "Chatbot not found.");
+    }
+
+    return sendJson(res, 200, {
+      id: chatbot.id,
+      name: chatbot.name,
+      headerTitle: chatbot.headerTitle,
+      welcomeMessage: chatbot.welcomeMessage,
+      placeholder: chatbot.placeholder,
+      launcherLabel: chatbot.launcherLabel,
+      accentColor: chatbot.accentColor,
+      position: chatbot.position,
+      avatarLabel: chatbot.avatarLabel,
+      suggestedPrompts: chatbot.suggestedPrompts,
+    });
+  }
+
+  if (routeKey === "POST /api/public/chatbots/:id/messages") {
+    const chatbot = findChatbotById(snapshot, params.id);
+    if (!chatbot) {
+      throw new HttpError(404, "Chatbot not found.");
+    }
+
+    const message = assertString(body.message, "message");
+    const assistantMessage = {
+      id: uniqueId("msg"),
+      role: "model",
+      text: findFaqResponse(message, snapshot, chatbot.id),
+      timestamp: nowIso(),
+    };
+
+    return sendJson(res, 200, {
+      assistantMessage,
+      chatbot: {
+        id: chatbot.id,
+        name: chatbot.name,
+      },
     });
   }
 
@@ -1571,6 +2244,7 @@ const buildRouteKey = (method, pathname) => {
     "/health",
     "/api",
     "/api/docs",
+    "/embed/chatbot.js",
     "/api/auth/login",
     "/api/auth/register",
     "/api/auth/magic-link",
@@ -1584,10 +2258,12 @@ const buildRouteKey = (method, pathname) => {
     "/api/settings",
     "/api/onboarding/faqs",
     "/api/onboarding/complete",
+    "/api/voice-agents",
     "/api/agent",
     "/api/agent/faqs",
     "/api/agent/faqs/sync",
     "/api/agent/restart",
+    "/api/chatbots",
     "/api/messenger/messages",
     "/api/calls",
     "/api/calls/simulate",
@@ -1608,7 +2284,14 @@ const buildRouteKey = (method, pathname) => {
   }
 
   const dynamicPatterns = [
+    "/api/voice-agents/:id",
+    "/api/voice-agents/:id/activate",
     "/api/agent/faqs/:id",
+    "/api/chatbots/:id",
+    "/api/chatbots/:id/activate",
+    "/api/chatbots/:id/embed",
+    "/api/public/chatbots/:id/config",
+    "/api/public/chatbots/:id/messages",
     "/api/calls/:id",
     "/api/calls/:id/transcript",
     "/api/calls/:id/report",
@@ -1638,11 +2321,15 @@ export const createAgentlyServer = async ({
     provider: storeProvider,
     dataFile,
     createDefaultState,
+    normalizeState: normalizeWorkspaceState,
   });
   await store.init();
 
   const handleRequest = async (req, res, overrideRouteContext = null) => {
     try {
+      const requestTarget = req.originalUrl || req.url || "/";
+      const url = new URL(requestTarget, `http://${req.headers.host || "localhost"}`);
+      res.__corsPathname = url.pathname;
       setCorsHeaders(res);
 
       if (req.method === "OPTIONS") {
@@ -1651,8 +2338,6 @@ export const createAgentlyServer = async ({
         return;
       }
 
-      const requestTarget = req.originalUrl || req.url || "/";
-      const url = new URL(requestTarget, `http://${req.headers.host || "localhost"}`);
       const { routeKey, params } = overrideRouteContext || buildRouteKey(req.method, url.pathname);
       if (!KNOWN_ROUTE_KEYS.has(routeKey)) {
         throw new HttpError(404, `No handler was found for ${url.pathname}.`);
@@ -1684,6 +2369,7 @@ export const createAgentlyServer = async ({
   const app = express();
   app.disable("x-powered-by");
   app.use((req, res, next) => {
+    res.__corsPathname = req.path || req.url || "";
     setCorsHeaders(res);
 
     if (req.method === "OPTIONS") {

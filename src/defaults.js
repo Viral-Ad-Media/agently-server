@@ -14,6 +14,7 @@ export const USER_ROLES = ["Owner", "Admin", "Viewer"];
 export const AGENT_TONES = ["Professional", "Friendly", "Empathetic"];
 export const AGENT_LANGUAGES = ["English", "Spanish", "French", "German"];
 export const AGENT_VOICES = ["Zephyr", "Puck", "Charon", "Kore", "Fenrir"];
+export const CHATBOT_POSITIONS = ["left", "right"];
 export const SUBSCRIPTION_PLANS = ["Starter", "Pro", "None"];
 
 export const PLAN_LIMITS = {
@@ -52,6 +53,46 @@ export const INITIAL_FAQS = [
   },
 ];
 
+const cloneFaqs = (faqs = INITIAL_FAQS) => faqs.map((faq) => ({ ...faq }));
+
+export const createVoiceAgent = (overrides = {}) => ({
+  id: overrides.id || "voice_agent_1",
+  name: overrides.name || "Maya",
+  voice: overrides.voice || "Zephyr",
+  language: overrides.language || "English",
+  greeting: overrides.greeting || "Hello, thank you for calling Bright Path Dental. This is Maya. How can I assist you today?",
+  tone: overrides.tone || "Professional",
+  businessHours: overrides.businessHours || "09:00 - 17:00",
+  faqs: cloneFaqs(overrides.faqs),
+  escalationPhone: overrides.escalationPhone || "+1 (202) 555-0100",
+  voicemailFallback: overrides.voicemailFallback ?? true,
+  dataCaptureFields: Array.isArray(overrides.dataCaptureFields) && overrides.dataCaptureFields.length > 0
+    ? [...overrides.dataCaptureFields]
+    : ["name", "phone", "reason"],
+  rules: {
+    autoBook: overrides.rules?.autoBook ?? true,
+    autoEscalate: overrides.rules?.autoEscalate ?? true,
+    captureAllLeads: overrides.rules?.captureAllLeads ?? true,
+  },
+});
+
+export const createChatbot = (overrides = {}) => ({
+  id: overrides.id || "chatbot_1",
+  name: overrides.name || "Website Concierge",
+  voiceAgentId: overrides.voiceAgentId || "voice_agent_1",
+  headerTitle: overrides.headerTitle || "Bright Path Dental Assistant",
+  welcomeMessage: overrides.welcomeMessage || "Hi there! I'm here to answer questions, capture details, and help your visitors get the right next step.",
+  placeholder: overrides.placeholder || "Ask about services, pricing, or availability...",
+  launcherLabel: overrides.launcherLabel || "Chat with us",
+  accentColor: overrides.accentColor || "#4F46E5",
+  position: overrides.position || "right",
+  avatarLabel: overrides.avatarLabel || "BP",
+  customPrompt: overrides.customPrompt || "Keep responses concise, on-brand, and focused on helping visitors convert.",
+  suggestedPrompts: Array.isArray(overrides.suggestedPrompts) && overrides.suggestedPrompts.length > 0
+    ? [...overrides.suggestedPrompts]
+    : ["What services do you offer?", "What are your hours?", "Can I book an appointment?"],
+});
+
 const buildInvoice = (id, daysAgo, amount, status) => ({
   id,
   date: iso(now - daysAgo * 24 * 60 * 60 * 1000),
@@ -87,23 +128,22 @@ export const createDefaultState = () => ({
       onboarded: true,
       timezone: "America/New_York",
     },
-    agent: {
-      name: "Maya",
-      voice: "Zephyr",
-      language: "English",
-      greeting: "Hello, thank you for calling Bright Path Dental. This is Maya. How can I assist you today?",
-      tone: "Professional",
-      businessHours: "09:00 - 17:00",
-      faqs: INITIAL_FAQS,
-      escalationPhone: "+1 (202) 555-0100",
-      voicemailFallback: true,
-      dataCaptureFields: ["name", "phone", "reason"],
-      rules: {
-        autoBook: true,
-        autoEscalate: true,
-        captureAllLeads: true,
-      },
-    },
+    activeVoiceAgentId: "voice_agent_1",
+    voiceAgents: [
+      createVoiceAgent({
+        id: "voice_agent_1",
+      }),
+    ],
+    agent: createVoiceAgent({
+      id: "voice_agent_1",
+    }),
+    activeChatbotId: "chatbot_1",
+    chatbots: [
+      createChatbot({
+        id: "chatbot_1",
+        voiceAgentId: "voice_agent_1",
+      }),
+    ],
     subscription: {
       plan: "Starter",
       status: "active",
@@ -219,8 +259,85 @@ export const createDefaultState = () => ({
   ],
   conversations: {
     default: [],
+    byChatbotId: {
+      chatbot_1: [],
+    },
   },
   contactMessages: [],
   salesInquiries: [],
   auditLog: [],
 });
+
+const isPlainObject = (value) => value != null && typeof value === "object" && !Array.isArray(value);
+
+const hydrateVoiceAgent = (agent, index) => createVoiceAgent({
+  ...agent,
+  id: agent?.id || `voice_agent_${index + 1}`,
+  faqs: Array.isArray(agent?.faqs) && agent.faqs.length > 0 ? agent.faqs : INITIAL_FAQS,
+  dataCaptureFields: Array.isArray(agent?.dataCaptureFields) ? agent.dataCaptureFields : undefined,
+  rules: isPlainObject(agent?.rules) ? agent.rules : undefined,
+});
+
+const hydrateChatbot = (chatbot, index, fallbackVoiceAgentId, organizationName) => createChatbot({
+  ...chatbot,
+  id: chatbot?.id || `chatbot_${index + 1}`,
+  voiceAgentId: chatbot?.voiceAgentId || fallbackVoiceAgentId,
+  headerTitle: chatbot?.headerTitle || `${organizationName} Assistant`,
+});
+
+export const normalizeWorkspaceState = (state) => {
+  const next = structuredClone(state);
+  const organization = next.organization || {};
+  const organizationName = organization.profile?.name || "Agently";
+
+  const voiceAgentsSource = Array.isArray(organization.voiceAgents) && organization.voiceAgents.length > 0
+    ? organization.voiceAgents
+    : [organization.agent || createVoiceAgent()];
+
+  organization.voiceAgents = voiceAgentsSource.map((agent, index) => hydrateVoiceAgent(agent, index));
+  organization.activeVoiceAgentId = organization.voiceAgents.some((agent) => agent.id === organization.activeVoiceAgentId)
+    ? organization.activeVoiceAgentId
+    : organization.voiceAgents[0].id;
+
+  const activeVoiceAgent = organization.voiceAgents.find((agent) => agent.id === organization.activeVoiceAgentId) || organization.voiceAgents[0];
+  organization.agent = activeVoiceAgent;
+
+  const chatbotsSource = Array.isArray(organization.chatbots) && organization.chatbots.length > 0
+    ? organization.chatbots
+    : [
+      createChatbot({
+        voiceAgentId: activeVoiceAgent.id,
+        headerTitle: `${organizationName} Assistant`,
+      }),
+    ];
+
+  organization.chatbots = chatbotsSource.map((chatbot, index) => {
+    const preferredVoiceAgentId = organization.voiceAgents.some((agent) => agent.id === chatbot?.voiceAgentId)
+      ? chatbot.voiceAgentId
+      : activeVoiceAgent.id;
+    return hydrateChatbot(chatbot, index, preferredVoiceAgentId, organizationName);
+  });
+
+  organization.activeChatbotId = organization.chatbots.some((chatbot) => chatbot.id === organization.activeChatbotId)
+    ? organization.activeChatbotId
+    : organization.chatbots[0].id;
+
+  next.organization = organization;
+  next.conversations = isPlainObject(next.conversations) ? next.conversations : {};
+
+  const legacyConversation = Array.isArray(next.conversations.default) ? next.conversations.default : [];
+  const byChatbotIdSource = isPlainObject(next.conversations.byChatbotId) ? next.conversations.byChatbotId : {};
+  const normalizedByChatbotId = {};
+
+  for (const chatbot of organization.chatbots) {
+    const existingThread = Array.isArray(byChatbotIdSource[chatbot.id]) ? byChatbotIdSource[chatbot.id] : null;
+    normalizedByChatbotId[chatbot.id] = existingThread
+      ? structuredClone(existingThread)
+      : (chatbot.id === organization.activeChatbotId ? structuredClone(legacyConversation) : []);
+  }
+
+  next.conversations.byChatbotId = normalizedByChatbotId;
+  next.conversations.default = next.conversations.byChatbotId[organization.activeChatbotId] || [];
+
+  return next;
+};

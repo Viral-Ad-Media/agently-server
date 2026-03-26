@@ -50,10 +50,11 @@ const parseJsonResponse = async (response, context) => {
 };
 
 export class JsonStore {
-  constructor(filePath, createDefaultState) {
+  constructor(filePath, createDefaultState, normalizeState = (value) => value) {
     this.mode = "json";
     this.filePath = filePath;
     this.createDefaultState = createDefaultState;
+    this.normalizeState = normalizeState;
     this.state = null;
   }
 
@@ -62,14 +63,14 @@ export class JsonStore {
 
     try {
       const raw = await readFile(this.filePath, "utf8");
-      this.state = hydrateState(this.createDefaultState, JSON.parse(raw));
+      this.state = this.normalizeState(hydrateState(this.createDefaultState, JSON.parse(raw)));
       await this.persist();
     } catch (error) {
       if (error.code !== "ENOENT") {
         throw error;
       }
 
-      this.state = this.createDefaultState();
+      this.state = this.normalizeState(this.createDefaultState());
       await this.persist();
     }
   }
@@ -81,13 +82,13 @@ export class JsonStore {
   async update(mutator) {
     const draft = clone(this.state);
     const result = await mutator(draft);
-    this.state = draft;
+    this.state = this.normalizeState(draft);
     await this.persist();
     return result;
   }
 
   async replace(nextState) {
-    this.state = clone(nextState);
+    this.state = this.normalizeState(clone(nextState));
     await this.persist();
   }
 
@@ -97,7 +98,7 @@ export class JsonStore {
 }
 
 export class SupabaseStateStore {
-  constructor({ url, serviceRoleKey, schema = "public", table = "agently_state", rowId = "primary", createDefaultState }) {
+  constructor({ url, serviceRoleKey, schema = "public", table = "agently_state", rowId = "primary", createDefaultState, normalizeState = (value) => value }) {
     this.mode = "supabase";
     this.url = url.replace(/\/$/, "");
     this.serviceRoleKey = serviceRoleKey;
@@ -105,6 +106,7 @@ export class SupabaseStateStore {
     this.table = table;
     this.rowId = rowId;
     this.createDefaultState = createDefaultState;
+    this.normalizeState = normalizeState;
   }
 
   buildHeaders(extra = {}) {
@@ -165,19 +167,19 @@ export class SupabaseStateStore {
 
     const existingRow = await this.fetchRow();
     if (!existingRow) {
-      await this.upsertState(this.createDefaultState());
+      await this.upsertState(this.normalizeState(this.createDefaultState()));
     }
   }
 
   async read() {
     const row = await this.fetchRow();
     if (!row) {
-      const nextState = this.createDefaultState();
+      const nextState = this.normalizeState(this.createDefaultState());
       await this.upsertState(nextState);
       return clone(nextState);
     }
 
-    const hydratedState = hydrateState(this.createDefaultState, row.payload);
+    const hydratedState = this.normalizeState(hydrateState(this.createDefaultState, row.payload));
     if (JSON.stringify(hydratedState) !== JSON.stringify(row.payload)) {
       await this.upsertState(hydratedState);
     }
@@ -189,12 +191,12 @@ export class SupabaseStateStore {
     const currentState = await this.read();
     const draft = clone(currentState);
     const result = await mutator(draft);
-    await this.upsertState(draft);
+    await this.upsertState(this.normalizeState(draft));
     return result;
   }
 
   async replace(nextState) {
-    await this.upsertState(clone(nextState));
+    await this.upsertState(this.normalizeState(clone(nextState)));
   }
 }
 
@@ -202,6 +204,7 @@ export const createStore = ({
   provider = process.env.AGENTLY_STORE_PROVIDER,
   dataFile,
   createDefaultState,
+  normalizeState,
 } = {}) => {
   const resolvedProvider = provider || (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY ? "supabase" : "json");
 
@@ -213,11 +216,12 @@ export const createStore = ({
       table: process.env.SUPABASE_STATE_TABLE || "agently_state",
       rowId: process.env.SUPABASE_STATE_ROW_ID || "primary",
       createDefaultState,
+      normalizeState,
     });
   }
 
   if (resolvedProvider === "json") {
-    return new JsonStore(dataFile, createDefaultState);
+    return new JsonStore(dataFile, createDefaultState, normalizeState);
   }
 
   throw new Error(`Unsupported store provider: ${resolvedProvider}`);
