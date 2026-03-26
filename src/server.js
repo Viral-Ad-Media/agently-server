@@ -2,6 +2,7 @@ import http from "node:http";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import express from "express";
 
 import {
   AGENT_LANGUAGES,
@@ -1637,7 +1638,7 @@ export const createAgentlyServer = async ({
   });
   await store.init();
 
-  const handler = async (req, res) => {
+  const handleRequest = async (req, res, overrideRouteContext = null) => {
     try {
       setCorsHeaders(res);
 
@@ -1647,8 +1648,9 @@ export const createAgentlyServer = async ({
         return;
       }
 
-      const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
-      const { routeKey, params } = buildRouteKey(req.method, url.pathname);
+      const requestTarget = req.originalUrl || req.url || "/";
+      const url = new URL(requestTarget, `http://${req.headers.host || "localhost"}`);
+      const { routeKey, params } = overrideRouteContext || buildRouteKey(req.method, url.pathname);
       if (!KNOWN_ROUTE_KEYS.has(routeKey)) {
         throw new HttpError(404, `No handler was found for ${url.pathname}.`);
       }
@@ -1676,17 +1678,39 @@ export const createAgentlyServer = async ({
     }
   };
 
-  const server = http.createServer(handler);
+  const app = express();
+  app.disable("x-powered-by");
+
+  for (const entry of ROUTE_DOCS) {
+    const methodName = entry.method.toLowerCase();
+    app[methodName](entry.path, (req, res) => {
+      void handleRequest(req, res, {
+        routeKey: `${entry.method} ${entry.path}`,
+        params: req.params || {},
+      });
+    });
+  }
+
+  app.use((req, res) => {
+    void handleRequest(req, res);
+  });
+
+  const server = http.createServer(app);
 
   server.keepAliveTimeout = 10_000;
 
   return {
+    app,
     server,
     store,
-    handler,
+    handler: handleRequest,
     start: () =>
       new Promise((resolve) => {
-        server.listen(port, host, () => resolve({ port, host, dataFile }));
+        server.listen(port, host, () => {
+          const address = server.address();
+          const resolvedPort = typeof address === "object" && address ? address.port : port;
+          resolve({ port: resolvedPort, host, dataFile });
+        });
       }),
   };
 };

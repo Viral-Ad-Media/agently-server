@@ -1,6 +1,6 @@
 # Agently Backend
 
-Node backend for the Agently SaaS workspace. It exposes the full API used by the frontend and persists workspace state in Supabase by default.
+Express backend for the Agently SaaS workspace. It exposes the full API used by the frontend and persists workspace state in Supabase by default.
 
 ## What It Handles
 
@@ -22,7 +22,7 @@ The server uses two storage modes:
 - `supabase`: primary mode for real persistence
 - `json`: offline fallback for local development and automated tests
 
-Supabase storage is implemented through the REST API, so there are still no extra runtime dependencies.
+Supabase storage is implemented through the REST API. Express is the only added backend framework dependency.
 
 ## Setup
 
