@@ -24,6 +24,7 @@ const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 
 const BODY_METHODS = new Set(["POST", "PATCH", "PUT", "DELETE"]);
 const PUBLIC_ROUTES = new Set([
+  "GET /",
   "GET /health",
   "GET /api",
   "GET /api/docs",
@@ -36,6 +37,7 @@ const PUBLIC_ROUTES = new Set([
 ]);
 
 const ROUTE_DOCS = [
+  { method: "GET", path: "/", auth: false, description: "Root landing response for serverless platforms and uptime checks." },
   { method: "GET", path: "/health", auth: false, description: "Simple uptime and health check." },
   { method: "GET", path: "/api", auth: false, description: "Small API landing response with version and docs link." },
   { method: "GET", path: "/api/docs", auth: false, description: "Structured list of every available endpoint." },
@@ -708,7 +710,7 @@ const route = async (req, res, url, store, routeKey, params) => {
     });
   }
 
-  if (routeKey === "GET /api") {
+  if (routeKey === "GET /" || routeKey === "GET /api") {
     return sendJson(res, 200, {
       service: "Agently Backend API",
       version: "1.0.0",
@@ -1565,6 +1567,7 @@ const route = async (req, res, url, store, routeKey, params) => {
 
 const buildRouteKey = (method, pathname) => {
   const exactRoutes = [
+    "/",
     "/health",
     "/api",
     "/api/docs",
