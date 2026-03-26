@@ -1683,6 +1683,17 @@ export const createAgentlyServer = async ({
 
   const app = express();
   app.disable("x-powered-by");
+  app.use((req, res, next) => {
+    setCorsHeaders(res);
+
+    if (req.method === "OPTIONS") {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    next();
+  });
 
   for (const entry of ROUTE_DOCS) {
     const methodName = entry.method.toLowerCase();
