@@ -1715,6 +1715,24 @@ export const createAgentlyServer = async ({
   };
 };
 
+let cachedDefaultAppPromise = null;
+
+const getDefaultApp = async () => {
+  if (!cachedDefaultAppPromise) {
+    const dataFile = process.env.AGENTLY_DATA_FILE
+      || (process.env.VERCEL ? path.join("/tmp", "agently-store.json") : DEFAULT_DATA_FILE);
+
+    cachedDefaultAppPromise = createAgentlyServer({ dataFile }).then(({ app }) => app);
+  }
+
+  return cachedDefaultAppPromise;
+};
+
+export default async function handler(req, res) {
+  const app = await getDefaultApp();
+  return app(req, res);
+}
+
 const isMainModule = process.argv[1] === __filename;
 
 if (isMainModule) {
