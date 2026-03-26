@@ -1,51 +1,72 @@
-# Agently Backend Server
+# Agently Backend
 
-Standalone Node backend for the Agently frontend demo. It uses only built-in Node modules, prefers Supabase for persistence, and exposes the full API surface the current app needs.
+Node backend for the Agently SaaS workspace. It exposes the full API used by the frontend and persists workspace state in Supabase by default.
 
-## Features
+## What It Handles
 
-- Zero external dependencies
-- Supabase-backed persistence through the REST API
-- Local JSON fallback for offline development and tests
-- Demo auth with bearer tokens
-- Onboarding, organization, agent, dashboard, messaging, calls, leads, team, billing, and contact endpoints
-- Built-in API docs route
-- Local smoke tests with `node --test`
+- session auth, registration, and secure-link verification
+- onboarding and FAQ generation
+- dashboard bootstrap and analytics
+- agent configuration and FAQ CRUD
+- messenger threads
+- call simulation, transcripts, and downloadable reports
+- lead CRUD and CSV export
+- team invitations and member removal
+- billing plan updates, cancellation, and invoice downloads
+- public contact and sales submissions
 
-## Run
+## Persistence
 
-1. Create the Supabase table with [supabase/001_agently_state.sql](/Users/demola/www/Agently-/agently-server/supabase/001_agently_state.sql).
-2. Copy [.env.example](/Users/demola/www/Agently-/agently-server/.env.example) to `.env` and fill in your Supabase values. The `npm run start` and `npm run dev` scripts load `.env` automatically.
-3. Run:
+The server uses two storage modes:
 
-```bash
-cd agently-server
-npm run start
-```
+- `supabase`: primary mode for real persistence
+- `json`: offline fallback for local development and automated tests
 
-The server defaults to `http://localhost:4000`.
+Supabase storage is implemented through the REST API, so there are still no extra runtime dependencies.
 
-## Environment variables
+## Setup
+
+### 1. Create the Supabase table
+
+Run [001_agently_state.sql](/Users/demola/www/Agently-/agently-server/supabase/001_agently_state.sql) in your Supabase project.
+
+### 2. Configure environment variables
+
+Copy [.env.example](/Users/demola/www/Agently-/agently-server/.env.example) to `.env`.
+
+Important variables:
 
 - `PORT`: server port, defaults to `4000`
 - `ALLOWED_ORIGIN`: CORS origin, defaults to `*`
 - `AGENTLY_STORE_PROVIDER`: `supabase` or `json`
-- `SUPABASE_URL`: your Supabase project URL
+- `SUPABASE_URL`: Supabase project URL
 - `SUPABASE_SERVICE_ROLE_KEY`: service-role key used by the backend
 - `SUPABASE_SCHEMA`: schema name, defaults to `public`
 - `SUPABASE_STATE_TABLE`: table name, defaults to `agently_state`
-- `SUPABASE_STATE_ROW_ID`: row id used for the app snapshot, defaults to `primary`
+- `SUPABASE_STATE_ROW_ID`: row id, defaults to `primary`
 - `AGENTLY_DATA_FILE`: JSON fallback path when `AGENTLY_STORE_PROVIDER=json`
 
-## Demo auth
+### 3. Start the server
 
-Protected routes expect:
-
-```text
-Authorization: Bearer demo-owner-token
+```bash
+cd agently-server
+npm install
+npm run start
 ```
 
-You can also create a fresh session with:
+The server listens on `http://localhost:4000` by default.
+
+## Development Auth
+
+Protected routes use a bearer token.
+
+You can:
+
+- create a new session through `POST /api/auth/login`
+- register a workspace through `POST /api/auth/register`
+- use the seeded development token `demo-owner-token` for quick local API checks
+
+Example:
 
 ```bash
 curl -X POST http://localhost:4000/api/auth/login \
@@ -53,7 +74,7 @@ curl -X POST http://localhost:4000/api/auth/login \
   -d '{"email":"owner@example.com","password":"demo-password"}'
 ```
 
-## Core endpoints
+## Core Endpoints
 
 - `GET /health`
 - `GET /api`
@@ -106,9 +127,12 @@ curl -X POST http://localhost:4000/api/auth/login \
 - `POST /api/contact`
 - `POST /api/contact-sales`
 
-## Notes
+## Verification
 
-- Supabase is the primary persistence layer. The JSON store remains only as a fallback for offline development and tests.
-- AI-heavy actions use deterministic heuristics so the backend works offline.
-- The docs route at `GET /api/docs` returns descriptions, auth requirements, and sample headers.
-- The data file is created automatically on first run.
+Run the backend test suite with:
+
+```bash
+npm test
+```
+
+The tests intentionally use the JSON fallback so they can run without a live Supabase project.

@@ -38,9 +38,9 @@ const ROUTE_DOCS = [
   { method: "GET", path: "/health", auth: false, description: "Simple uptime and health check." },
   { method: "GET", path: "/api", auth: false, description: "Small API landing response with version and docs link." },
   { method: "GET", path: "/api/docs", auth: false, description: "Structured list of every available endpoint." },
-  { method: "POST", path: "/api/auth/login", auth: false, description: "Password login for demo users." },
-  { method: "POST", path: "/api/auth/register", auth: false, description: "Create a demo owner session and update the organization owner." },
-  { method: "POST", path: "/api/auth/magic-link", auth: false, description: "Create a demo magic-link token." },
+  { method: "POST", path: "/api/auth/login", auth: false, description: "Password login for an existing workspace member." },
+  { method: "POST", path: "/api/auth/register", auth: false, description: "Create a new owner session and bootstrap the workspace." },
+  { method: "POST", path: "/api/auth/magic-link", auth: false, description: "Create a one-time sign-in link token." },
   { method: "POST", path: "/api/auth/magic-link/verify", auth: false, description: "Exchange a magic-link token for a session." },
   { method: "GET", path: "/api/auth/me", auth: true, description: "Return the authenticated user and session summary." },
   { method: "POST", path: "/api/auth/logout", auth: true, description: "Invalidate the current bearer token." },
@@ -60,7 +60,7 @@ const ROUTE_DOCS = [
   { method: "DELETE", path: "/api/agent/faqs/:id", auth: true, description: "Delete a single FAQ entry." },
   { method: "POST", path: "/api/agent/faqs/sync", auth: true, description: "Regenerate FAQs from the organization website and replace the list." },
   { method: "POST", path: "/api/agent/restart", auth: true, description: "Record a restart event for the agent." },
-  { method: "GET", path: "/api/messenger/messages", auth: true, description: "Return the current demo messenger thread." },
+  { method: "GET", path: "/api/messenger/messages", auth: true, description: "Return the current messenger thread." },
   { method: "POST", path: "/api/messenger/messages", auth: true, description: "Append a user message and generate an agent reply." },
   { method: "DELETE", path: "/api/messenger/messages", auth: true, description: "Reset the messenger thread back to the greeting state." },
   { method: "GET", path: "/api/calls", auth: true, description: "List calls with search and outcome filters." },
@@ -713,7 +713,7 @@ const route = async (req, res, url, store, routeKey, params) => {
       version: "1.0.0",
       storeProvider: store.mode,
       docs: "/api/docs",
-      authHint: "Use Authorization: Bearer demo-owner-token on protected routes.",
+      authHint: "Use Authorization: Bearer <session-token> from login/register, or the seeded dev token demo-owner-token.",
     });
   }
 
@@ -724,7 +724,7 @@ const route = async (req, res, url, store, routeKey, params) => {
       baseUrl: `http://${req.headers.host || `localhost:${DEFAULT_PORT}`}`,
       auth: {
         type: "Bearer",
-        demoToken: "demo-owner-token",
+        seedToken: "demo-owner-token",
       },
       routes: ROUTE_DOCS,
     });
@@ -810,6 +810,9 @@ const route = async (req, res, url, store, routeKey, params) => {
   if (routeKey === "POST /api/auth/magic-link") {
     const email = assertString(body.email, "email");
     const magicLinkToken = uniqueId("magic");
+    const requestOrigin = typeof req.headers.origin === "string" && /^https?:\/\//.test(req.headers.origin)
+      ? req.headers.origin.replace(/\/$/, "")
+      : null;
 
     await store.update((draft) => {
       draft.auth.pendingMagicLinks.push({
@@ -820,10 +823,11 @@ const route = async (req, res, url, store, routeKey, params) => {
     });
 
     return sendJson(res, 200, {
-      message: "Magic link created for demo flow.",
+      message: "Magic link created.",
       email,
       magicLinkToken,
       verifyEndpoint: "/api/auth/magic-link/verify",
+      magicLinkUrl: requestOrigin ? `${requestOrigin}/#/login?magicToken=${encodeURIComponent(magicLinkToken)}` : null,
     });
   }
 
