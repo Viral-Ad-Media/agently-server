@@ -37,6 +37,10 @@ const DEFAULT_PORT = Number(process.env.PORT || 4000);
 const DEFAULT_HOST = "0.0.0.0";
 const DEFAULT_DATA_FILE = process.env.AGENTLY_DATA_FILE || path.join(__dirname, "..", "data", "store.json");
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
+const WEBSITE_IMPORT_TIMEOUT_MS = Number(process.env.AGENTLY_WEBSITE_IMPORT_TIMEOUT_MS || 8000);
+const WEBSITE_IMPORT_MAX_HTML_CHARS = Number(process.env.AGENTLY_WEBSITE_IMPORT_MAX_HTML_CHARS || 250_000);
+const WEBSITE_IMPORT_MAX_FAQS = 6;
+const WEBSITE_IMPORT_USER_AGENT = "Agently Knowledge Import/1.0";
 
 const BODY_METHODS = new Set(["POST", "PATCH", "PUT", "DELETE"]);
 const PUBLIC_ROUTES = new Set([
@@ -78,7 +82,7 @@ const ROUTE_DOCS = [
   { method: "PATCH", path: "/api/organization/profile", auth: true, description: "Update organization profile fields used during onboarding." },
   { method: "GET", path: "/api/settings", auth: true, description: "Return organization settings used by the settings screen." },
   { method: "PATCH", path: "/api/settings", auth: true, description: "Update organization settings like timezone or phone number." },
-  { method: "POST", path: "/api/onboarding/faqs", auth: true, description: "Generate starter FAQ entries from a website URL." },
+  { method: "POST", path: "/api/onboarding/faqs", auth: true, description: "Import FAQ entries from a public website URL with fallback starter content." },
   { method: "POST", path: "/api/onboarding/complete", auth: true, description: "Persist onboarding profile and agent configuration." },
   { method: "GET", path: "/api/voice-agents", auth: true, description: "List all configured voice agents." },
   { method: "POST", path: "/api/voice-agents", auth: true, description: "Create a new voice agent." },
@@ -92,7 +96,7 @@ const ROUTE_DOCS = [
   { method: "POST", path: "/api/agent/faqs", auth: true, description: "Create a custom FAQ entry." },
   { method: "PATCH", path: "/api/agent/faqs/:id", auth: true, description: "Update a single FAQ entry." },
   { method: "DELETE", path: "/api/agent/faqs/:id", auth: true, description: "Delete a single FAQ entry." },
-  { method: "POST", path: "/api/agent/faqs/sync", auth: true, description: "Regenerate FAQs from the organization website and replace the list." },
+  { method: "POST", path: "/api/agent/faqs/sync", auth: true, description: "Import FAQs from the organization website and replace the active voice-agent knowledge base." },
   { method: "POST", path: "/api/agent/restart", auth: true, description: "Record a restart event for the agent." },
   { method: "GET", path: "/api/chatbots", auth: true, description: "List all configured chatbots and their embed snippets." },
   { method: "POST", path: "/api/chatbots", auth: true, description: "Create a new customizable chatbot." },
@@ -613,6 +617,132 @@ const buildDashboard = (state) => {
   };
 };
 
+const normalizeWhitespace = (value) => String(value || "").replace(/\s+/g, " ").trim();
+
+const decodeHtmlEntities = (value) => String(value || "")
+  .replace(/&#(\d+);/g, (_, code) => {
+    const parsed = Number.parseInt(code, 10);
+    if (!Number.isFinite(parsed)) {
+      return " ";
+    }
+
+    try {
+      return String.fromCodePoint(parsed);
+    } catch {
+      return " ";
+    }
+  })
+  .replace(/&#x([0-9a-f]+);/gi, (_, code) => {
+    const parsed = Number.parseInt(code, 16);
+    if (!Number.isFinite(parsed)) {
+      return " ";
+    }
+
+    try {
+      return String.fromCodePoint(parsed);
+    } catch {
+      return " ";
+    }
+  })
+  .replace(/&nbsp;/gi, " ")
+  .replace(/&amp;/gi, "&")
+  .replace(/&quot;/gi, "\"")
+  .replace(/&(apos|#39);/gi, "'")
+  .replace(/&lt;/gi, "<")
+  .replace(/&gt;/gi, ">");
+
+const stripHtmlToText = (value) => normalizeWhitespace(
+  decodeHtmlEntities(
+    String(value || "")
+      .replace(/<br\s*\/?>/gi, " ")
+      .replace(/<\/(p|div|section|article|li|h[1-6]|tr)>/gi, " ")
+      .replace(/<[^>]+>/g, " ")
+  )
+);
+
+const truncateKnowledgeText = (value, maxLength = 360) => {
+  const normalized = normalizeWhitespace(value);
+  if (!normalized || normalized.length <= maxLength) {
+    return normalized;
+  }
+
+  const clipped = normalized.slice(0, maxLength + 1);
+  const boundary = clipped.lastIndexOf(" ");
+  const truncated = clipped.slice(0, boundary > 140 ? boundary : maxLength).trim().replace(/[,:;]+$/, "");
+  return `${truncated}.`;
+};
+
+const formatFaqQuestion = (value) => {
+  const normalized = normalizeWhitespace(value).replace(/[.:]+$/, "");
+  if (!normalized) {
+    return "";
+  }
+
+  return normalized.endsWith("?") ? normalized : `${normalized}?`;
+};
+
+const getResponseHeaderValue = (headers, name) => {
+  if (!headers) {
+    return "";
+  }
+
+  if (typeof headers.get === "function") {
+    return headers.get(name) || "";
+  }
+
+  return String(headers[name] || headers[name.toLowerCase()] || "");
+};
+
+const isIpv4Hostname = (hostname) => /^\d{1,3}(?:\.\d{1,3}){3}$/.test(hostname);
+
+const isPrivateIpv4Hostname = (hostname) => {
+  if (!isIpv4Hostname(hostname)) {
+    return false;
+  }
+
+  const octets = hostname.split(".").map((segment) => Number.parseInt(segment, 10));
+  if (octets.some((octet) => !Number.isFinite(octet) || octet < 0 || octet > 255)) {
+    return false;
+  }
+
+  return (
+    octets[0] === 10
+    || octets[0] === 127
+    || octets[0] === 0
+    || (octets[0] === 169 && octets[1] === 254)
+    || (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31)
+    || (octets[0] === 192 && octets[1] === 168)
+  );
+};
+
+const assertPublicWebsiteImportTarget = (website) => {
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(`https://${website}`);
+  } catch {
+    throw new HttpError(400, "website must be a valid public URL.");
+  }
+
+  const hostname = parsedUrl.hostname.toLowerCase();
+  if (!hostname) {
+    throw new HttpError(400, "website must be a valid public URL.");
+  }
+
+  if (
+    hostname === "localhost"
+    || hostname === "::1"
+    || hostname === "[::1]"
+    || hostname.endsWith(".local")
+    || hostname.endsWith(".internal")
+    || isPrivateIpv4Hostname(hostname)
+    || (!hostname.includes(".") && !isIpv4Hostname(hostname))
+  ) {
+    throw new HttpError(400, "website must be a public URL.");
+  }
+
+  return parsedUrl;
+};
+
 const inferIndustryFromWebsite = (website) => {
   const normalized = website.toLowerCase();
   if (normalized.includes("dental")) {
@@ -630,7 +760,7 @@ const inferIndustryFromWebsite = (website) => {
   return "SaaS";
 };
 
-const buildFaqsFromWebsite = (website, organization) => {
+const buildFallbackFaqEntriesFromWebsite = (website, organization) => {
   const normalized = normalizeWebsite(website);
   const businessName = organization?.profile?.name || normalized.split(".")[0] || "your business";
   const industry = organization?.profile?.industry || inferIndustryFromWebsite(normalized);
@@ -668,11 +798,231 @@ const buildFaqsFromWebsite = (website, organization) => {
     ],
   };
 
-  return (faqSets[industry] || faqSets.SaaS).map(([question, answer], index) => ({
-    id: uniqueId(`faq${index + 1}`),
+  return (faqSets[industry] || faqSets.SaaS).map(([question, answer]) => ({
     question,
     answer,
   }));
+};
+
+const stripNonContentHtml = (html) => String(html || "")
+  .replace(/<!--[\s\S]*?-->/g, " ")
+  .replace(/<(script|style|noscript|svg|iframe|form)[^>]*>[\s\S]*?<\/\1>/gi, " ");
+
+const extractWebsiteSummary = (html) => {
+  const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  const metaDescriptionMatch = html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([\s\S]*?)["'][^>]*>/i)
+    || html.match(/<meta[^>]+content=["']([\s\S]*?)["'][^>]+name=["']description["'][^>]*>/i);
+  const firstParagraphMatch = html.match(/<p[^>]*>([\s\S]*?)<\/p>/i);
+
+  return {
+    title: stripHtmlToText(titleMatch?.[1] || ""),
+    metaDescription: stripHtmlToText(metaDescriptionMatch?.[1] || ""),
+    firstParagraph: stripHtmlToText(firstParagraphMatch?.[1] || ""),
+  };
+};
+
+const buildQuestionFromHeading = (heading, businessName) => {
+  const normalized = normalizeWhitespace(heading).replace(/[.:]+$/, "");
+  const lower = normalized.toLowerCase();
+
+  if (!normalized || /^(home|menu|navigation|skip to content|log in|login|sign up)$/i.test(normalized)) {
+    return "";
+  }
+  if (/\babout\b|\bwho we are\b|\bwhat we do\b|\bour company\b/.test(lower)) {
+    return `What does ${businessName} do`;
+  }
+  if (/\bpricing\b|\bplans?\b|\bcost\b|\brates?\b/.test(lower)) {
+    return "How does pricing work";
+  }
+  if (/\bbook\b|\bschedule\b|\bappointment\b/.test(lower)) {
+    return "How does scheduling work";
+  }
+  if (/\bcontact\b|\breach\b|\bcall\b|\bemail\b/.test(lower)) {
+    return `How can I contact ${businessName}`;
+  }
+  if (/\bhours\b|\bopen\b|\bavailability\b|\b24\/7\b/.test(lower)) {
+    return `What are ${businessName}'s hours`;
+  }
+
+  return normalized;
+};
+
+const extractSectionKnowledgeEntries = (html, businessName) => {
+  const entries = [];
+  const sectionPattern = /<h([1-3])[^>]*>([\s\S]*?)<\/h\1>([\s\S]{0,1800}?)(?=<h[1-3][^>]*>|<\/main>|<\/body>|$)/gi;
+  let sectionMatch;
+
+  while ((sectionMatch = sectionPattern.exec(html)) && entries.length < 8) {
+    const heading = stripHtmlToText(sectionMatch[2]);
+    const question = buildQuestionFromHeading(heading, businessName);
+    if (!question) {
+      continue;
+    }
+
+    const contentHtml = sectionMatch[3];
+    const answerChunks = [];
+    const blockPattern = /<(p|li)[^>]*>([\s\S]*?)<\/\1>/gi;
+    let blockMatch;
+
+    while ((blockMatch = blockPattern.exec(contentHtml)) && answerChunks.length < 3) {
+      const blockText = stripHtmlToText(blockMatch[2]);
+      if (blockText.length >= 40) {
+        answerChunks.push(blockText);
+      }
+    }
+
+    const answer = answerChunks.length > 0
+      ? answerChunks.join(" ")
+      : stripHtmlToText(contentHtml);
+
+    if (answer.length >= 40) {
+      entries.push({ question, answer });
+    }
+  }
+
+  return entries;
+};
+
+const buildFaqRecords = (entries, generateId) => {
+  const faqs = [];
+  const seen = new Set();
+
+  for (const entry of entries) {
+    const question = formatFaqQuestion(entry?.question || "");
+    const answer = truncateKnowledgeText(entry?.answer || "");
+    if (question.length < 8 || answer.length < 24) {
+      continue;
+    }
+
+    const signature = `${question.toLowerCase()}|${answer.toLowerCase()}`;
+    if (seen.has(signature)) {
+      continue;
+    }
+
+    seen.add(signature);
+    faqs.push({
+      id: generateId("faq"),
+      question,
+      answer,
+    });
+
+    if (faqs.length >= WEBSITE_IMPORT_MAX_FAQS) {
+      break;
+    }
+  }
+
+  return faqs;
+};
+
+const fetchWebsiteHtml = async (website, fetchImpl = globalThis.fetch) => {
+  if (typeof fetchImpl !== "function") {
+    throw new Error("Website import fetch is unavailable.");
+  }
+
+  assertPublicWebsiteImportTarget(website);
+
+  const candidates = [`https://${website}`, `http://${website}`];
+  let lastError = null;
+
+  for (const candidate of candidates) {
+    const controller = typeof AbortController === "function" ? new AbortController() : null;
+    const timeoutId = controller
+      ? setTimeout(() => controller.abort(), WEBSITE_IMPORT_TIMEOUT_MS)
+      : null;
+
+    try {
+      const response = await fetchImpl(candidate, {
+        method: "GET",
+        redirect: "follow",
+        headers: {
+          Accept: "text/html,application/xhtml+xml",
+          "User-Agent": WEBSITE_IMPORT_USER_AGENT,
+        },
+        signal: controller?.signal,
+      });
+
+      if (!response?.ok) {
+        throw new Error(`Website import request failed with ${response?.status || "an unknown status"}.`);
+      }
+
+      const contentType = getResponseHeaderValue(response.headers, "content-type");
+      if (contentType && !/(text\/html|application\/xhtml\+xml)/i.test(contentType)) {
+        throw new Error(`Website import requires HTML content, received ${contentType}.`);
+      }
+
+      const html = await response.text();
+      if (!html || !html.trim()) {
+        throw new Error("Website import returned an empty response.");
+      }
+
+      return html.slice(0, WEBSITE_IMPORT_MAX_HTML_CHARS);
+    } catch (error) {
+      lastError = error;
+    } finally {
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+    }
+  }
+
+  throw lastError || new Error("Website import failed.");
+};
+
+const buildFaqsFromWebsite = async (website, organization, generateId = uniqueId, fetchImpl = globalThis.fetch) => {
+  const normalized = normalizeWebsite(website);
+  const fallbackEntries = buildFallbackFaqEntriesFromWebsite(normalized, organization);
+  const businessName = organization?.profile?.name || stripHtmlToText(normalized.split("/")[0] || "your business") || "your business";
+
+  try {
+    const html = stripNonContentHtml(await fetchWebsiteHtml(normalized, fetchImpl));
+    const summary = extractWebsiteSummary(html);
+    const knowledgeEntries = [];
+    const overviewAnswer = [summary.metaDescription, summary.firstParagraph].filter(Boolean).join(" ");
+
+    if (overviewAnswer) {
+      knowledgeEntries.push({
+        question: `What does ${businessName} do`,
+        answer: overviewAnswer,
+      });
+    } else if (summary.title) {
+      knowledgeEntries.push({
+        question: `What does ${businessName} do`,
+        answer: summary.title,
+      });
+    }
+
+    knowledgeEntries.push(...extractSectionKnowledgeEntries(html, businessName));
+
+    const fullText = stripHtmlToText(html);
+    const emailMatch = fullText.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+    const phoneMatch = fullText.match(/(?:\+?\d[\d()\-\s]{7,}\d)/);
+    if (emailMatch || phoneMatch) {
+      knowledgeEntries.push({
+        question: `How can I contact ${businessName}`,
+        answer: [
+          phoneMatch ? `Phone: ${phoneMatch[0].trim()}.` : "",
+          emailMatch ? `Email: ${emailMatch[0].trim()}.` : "",
+        ].filter(Boolean).join(" "),
+      });
+    }
+
+    const importedFaqs = buildFaqRecords(
+      knowledgeEntries.length >= 3 ? knowledgeEntries : [...knowledgeEntries, ...fallbackEntries],
+      generateId
+    );
+
+    if (importedFaqs.length > 0) {
+      return importedFaqs;
+    }
+  } catch (error) {
+    if (error instanceof HttpError) {
+      throw error;
+    }
+
+    console.warn(`Website import failed for ${normalized}:`, error?.message || error);
+  }
+
+  return buildFaqRecords(fallbackEntries, generateId);
 };
 
 const extractLeadDetails = (transcript, fallbackLead = {}) => {
@@ -1522,7 +1872,7 @@ const buildWidgetScript = (baseUrl) => `(() => {
     });
 })();`;
 
-const route = async (req, res, url, store, routeKey, params, twilioConfig) => {
+const route = async (req, res, url, store, routeKey, params, twilioConfig, websiteImportFetch) => {
   const snapshot = await store.read();
   const { session, user } = requireSession(req, snapshot, routeKey);
   const body = BODY_METHODS.has(req.method) ? await readRequestBody(req) : {};
@@ -1847,9 +2197,10 @@ const route = async (req, res, url, store, routeKey, params, twilioConfig) => {
 
   if (routeKey === "POST /api/onboarding/faqs") {
     const website = normalizeWebsite(body.website);
+    const faqs = await buildFaqsFromWebsite(website, snapshot.organization, uniqueId, websiteImportFetch);
     return sendJson(res, 200, {
       website,
-      faqs: buildFaqsFromWebsite(website, snapshot.organization),
+      faqs,
     });
   }
 
@@ -2252,10 +2603,11 @@ const route = async (req, res, url, store, routeKey, params, twilioConfig) => {
 
   if (routeKey === "POST /api/agent/faqs/sync") {
     const website = normalizeWebsite(body.website || snapshot.organization.profile.website);
+    const nextFaqs = await buildFaqsFromWebsite(website, snapshot.organization, uniqueId, websiteImportFetch);
 
     const faqs = await store.update((draft) => {
       draft.organization.profile.website = website;
-      draft.organization.agent.faqs = buildFaqsFromWebsite(website, draft.organization);
+      draft.organization.agent.faqs = nextFaqs;
       appendAuditEvent(draft, "agent.faq.sync", user.id, { website });
       return draft.organization.agent.faqs;
     });
@@ -3315,6 +3667,7 @@ export const createAgentlyServer = async ({
   dataFile = DEFAULT_DATA_FILE,
   storeProvider,
   twilio,
+  websiteImportFetch = globalThis.fetch,
 } = {}) => {
   const twilioConfig = resolveTwilioConfig(twilio);
   const store = createStore({
@@ -3343,7 +3696,7 @@ export const createAgentlyServer = async ({
         throw new HttpError(404, `No handler was found for ${url.pathname}.`);
       }
 
-      await route(req, res, url, store, routeKey, params, twilioConfig);
+      await route(req, res, url, store, routeKey, params, twilioConfig, websiteImportFetch);
     } catch (error) {
       if (error instanceof HttpError) {
         sendJson(res, error.status, {

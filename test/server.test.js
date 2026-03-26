@@ -7,7 +7,7 @@ import path from "node:path";
 
 import { createAgentlyServer } from "../src/server.js";
 
-const createTestContext = async (t, { initialState, twilio } = {}) => {
+const createTestContext = async (t, { initialState, twilio, websiteImportFetch } = {}) => {
   const tempDirectory = await mkdtemp(path.join(os.tmpdir(), "agently-server-"));
   const dataFile = path.join(tempDirectory, "store.json");
   if (initialState !== undefined) {
@@ -17,6 +17,7 @@ const createTestContext = async (t, { initialState, twilio } = {}) => {
     dataFile,
     storeProvider: "json",
     twilio,
+    websiteImportFetch,
   });
 
   t.after(async () => {
@@ -198,6 +199,123 @@ test("register hydrates an incomplete persisted state before writing", async (t)
 
   assert.equal(registerResponse.status, 201);
   assert.equal(registerResponse.json.user.email, "recovered-owner@example.com");
+});
+
+test("onboarding FAQ import extracts knowledge from website HTML", async (t) => {
+  const websiteImportFetch = async () => ({
+    ok: true,
+    status: 200,
+    headers: {
+      get(name) {
+        return name.toLowerCase() === "content-type" ? "text/html; charset=utf-8" : "";
+      },
+    },
+    async text() {
+      return `
+        <html>
+          <head>
+            <title>Acme Receptionists</title>
+            <meta name="description" content="Acme helps home service teams answer calls, capture leads, and book jobs without missing customers." />
+          </head>
+          <body>
+            <main>
+              <h1>24/7 call handling</h1>
+              <p>Our voice agents answer calls around the clock, qualify leads, and hand urgent issues to your team fast.</p>
+              <h2>Booking and scheduling</h2>
+              <p>Customers can request appointments, share addresses, and leave callback preferences for the team.</p>
+              <h2>Contact us</h2>
+              <p>Call +1 (833) 555-0110 or email hello@acme.example for onboarding support.</p>
+            </main>
+          </body>
+        </html>
+      `;
+    },
+  });
+
+  const { handler } = await createTestContext(t, { websiteImportFetch });
+  const response = await invoke({
+    handler,
+    method: "POST",
+    path: "/api/onboarding/faqs",
+    token: "demo-owner-token",
+    body: {
+      website: "acme.example.com",
+    },
+  });
+
+  assert.equal(response.status, 200);
+  assert.equal(response.json.website, "acme.example.com");
+  assert.ok(response.json.faqs.some((faq) => faq.answer.includes("answer calls around the clock")));
+  assert.ok(response.json.faqs.some((faq) => faq.answer.includes("hello@acme.example")));
+});
+
+test("agent FAQ sync replaces knowledge with imported website content", async (t) => {
+  const websiteImportFetch = async () => ({
+    ok: true,
+    status: 200,
+    headers: {
+      get(name) {
+        return name.toLowerCase() === "content-type" ? "text/html; charset=utf-8" : "";
+      },
+    },
+    async text() {
+      return `
+        <html>
+          <head>
+            <meta name="description" content="Bright Clinic helps patients request appointments and get fast answers from a virtual receptionist." />
+          </head>
+          <body>
+            <main>
+              <h1>Insurance and intake</h1>
+              <p>Patients can share insurance details, appointment goals, and callback preferences before a staff member follows up.</p>
+              <h2>Urgent questions</h2>
+              <p>After-hours callers can leave urgent concerns and the office can prioritize them the next morning.</p>
+            </main>
+          </body>
+        </html>
+      `;
+    },
+  });
+
+  const { handler } = await createTestContext(t, { websiteImportFetch });
+  const syncResponse = await invoke({
+    handler,
+    method: "POST",
+    path: "/api/agent/faqs/sync",
+    token: "demo-owner-token",
+    body: {
+      website: "brightclinic.example",
+    },
+  });
+
+  assert.equal(syncResponse.status, 200);
+  assert.ok(syncResponse.json.faqs.some((faq) => faq.answer.includes("insurance details")));
+
+  const faqsResponse = await invoke({
+    handler,
+    method: "GET",
+    path: "/api/agent/faqs",
+    token: "demo-owner-token",
+  });
+
+  assert.equal(faqsResponse.status, 200);
+  assert.ok(faqsResponse.json.some((faq) => faq.answer.includes("insurance details")));
+});
+
+test("website import rejects localhost targets", async (t) => {
+  const { handler } = await createTestContext(t);
+  const response = await invoke({
+    handler,
+    method: "POST",
+    path: "/api/onboarding/faqs",
+    token: "demo-owner-token",
+    body: {
+      website: "localhost:3000",
+    },
+  });
+
+  assert.equal(response.status, 400);
+  assert.match(response.json.error.message, /public URL/i);
 });
 
 test("voice agent and chatbot collections support creation and public embed delivery", async (t) => {
