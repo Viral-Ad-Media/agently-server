@@ -56,6 +56,21 @@ npm run start
 
 The server listens on `http://localhost:4000` by default.
 
+## Vercel Deployment
+
+This project now exposes an Express default export from [src/index.js](/Users/demola/www/Agently-/agently-server/src/index.js), which matches Vercel's supported Express entrypoints.
+
+For production on Vercel, set these environment variables:
+
+- `AGENTLY_STORE_PROVIDER=supabase`
+- `SUPABASE_URL`
+- `SUPABASE_SERVICE_ROLE_KEY`
+- `SUPABASE_SCHEMA`
+- `SUPABASE_STATE_TABLE`
+- `SUPABASE_STATE_ROW_ID`
+
+If those Supabase variables are missing, the app will fall back to the JSON store. On Vercel that fallback uses `/tmp/agently-store.json`, which prevents a read-only filesystem crash but does not give durable persistence across deployments or cold starts.
+
 ## Development Auth
 
 Protected routes use a bearer token.
