@@ -29,6 +29,7 @@ Supabase storage is implemented through the REST API. Express is the only added 
 ### 1. Create the Supabase table
 
 Run [001_agently_state.sql](/Users/demola/www/Agently-/agently-server/supabase/001_agently_state.sql) in your Supabase project.
+The backend will create and hydrate the `primary` state row automatically, so the migration should only create the table and not seed `payload` with `{}`.
 
 ### 2. Configure environment variables
 

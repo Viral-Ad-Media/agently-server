@@ -3,6 +3,39 @@ import path from "node:path";
 
 const clone = (value) => structuredClone(value);
 
+const isPlainObject = (value) => (
+  value != null
+  && typeof value === "object"
+  && !Array.isArray(value)
+);
+
+const mergeWithDefaults = (defaults, value) => {
+  if (Array.isArray(defaults)) {
+    return Array.isArray(value) ? clone(value) : clone(defaults);
+  }
+
+  if (isPlainObject(defaults)) {
+    const next = {};
+    const source = isPlainObject(value) ? value : {};
+
+    for (const key of Object.keys(defaults)) {
+      next[key] = mergeWithDefaults(defaults[key], source[key]);
+    }
+
+    for (const key of Object.keys(source)) {
+      if (!(key in next)) {
+        next[key] = clone(source[key]);
+      }
+    }
+
+    return next;
+  }
+
+  return value === undefined ? defaults : clone(value);
+};
+
+const hydrateState = (createDefaultState, value) => mergeWithDefaults(createDefaultState(), value);
+
 const parseJsonResponse = async (response, context) => {
   if (!response.ok) {
     const body = await response.text();
@@ -29,7 +62,8 @@ export class JsonStore {
 
     try {
       const raw = await readFile(this.filePath, "utf8");
-      this.state = JSON.parse(raw);
+      this.state = hydrateState(this.createDefaultState, JSON.parse(raw));
+      await this.persist();
     } catch (error) {
       if (error.code !== "ENOENT") {
         throw error;
@@ -143,7 +177,12 @@ export class SupabaseStateStore {
       return clone(nextState);
     }
 
-    return clone(row.payload);
+    const hydratedState = hydrateState(this.createDefaultState, row.payload);
+    if (JSON.stringify(hydratedState) !== JSON.stringify(row.payload)) {
+      await this.upsertState(hydratedState);
+    }
+
+    return clone(hydratedState);
   }
 
   async update(mutator) {

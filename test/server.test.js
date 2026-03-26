@@ -1,14 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
 import { createAgentlyServer } from "../src/server.js";
 
-const createTestContext = async (t) => {
+const createTestContext = async (t, { initialState } = {}) => {
   const tempDirectory = await mkdtemp(path.join(os.tmpdir(), "agently-server-"));
   const dataFile = path.join(tempDirectory, "store.json");
+  if (initialState !== undefined) {
+    await writeFile(dataFile, JSON.stringify(initialState, null, 2), "utf8");
+  }
   const { handler } = await createAgentlyServer({
     dataFile,
     storeProvider: "json",
@@ -161,6 +164,27 @@ test("register accepts preflight and creates a new workspace session", async (t)
   assert.ok(registerResponse.headers["access-control-allow-origin"]);
   assert.ok(registerResponse.json.token);
   assert.equal(registerResponse.json.user.email, "new-owner@example.com");
+});
+
+test("register hydrates an incomplete persisted state before writing", async (t) => {
+  const { handler } = await createTestContext(t, {
+    initialState: {},
+  });
+
+  const registerResponse = await invoke({
+    handler,
+    method: "POST",
+    path: "/api/auth/register",
+    body: {
+      name: "Recovered Owner",
+      email: "recovered-owner@example.com",
+      password: "demo-password",
+      companyName: "Recovered Workspace",
+    },
+  });
+
+  assert.equal(registerResponse.status, 201);
+  assert.equal(registerResponse.json.user.email, "recovered-owner@example.com");
 });
 
 test("faq sync, messenger, call simulation, and csv export all respond", async (t) => {
