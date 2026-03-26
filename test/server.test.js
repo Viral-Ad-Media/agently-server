@@ -21,7 +21,7 @@ const createTestContext = async (t) => {
   return { handler };
 };
 
-const invoke = async ({ handler, method, path: requestPath, token, body }) => {
+const invoke = async ({ handler, method, path: requestPath, token, body, headers: extraHeaders = {} }) => {
   const payload = body == null
     ? ""
     : typeof body === "string"
@@ -38,6 +38,7 @@ const invoke = async ({ handler, method, path: requestPath, token, body }) => {
   if (token) {
     headers.authorization = `Bearer ${token}`;
   }
+  Object.assign(headers, extraHeaders);
 
   const req = {
     method,
@@ -122,6 +123,44 @@ test("login returns a bearer token and authenticated endpoints work", async (t) 
   assert.equal(dashboardResponse.status, 200);
   const dashboardPayload = dashboardResponse.json;
   assert.equal(typeof dashboardPayload.stats.totalCalls, "number");
+});
+
+test("register accepts preflight and creates a new workspace session", async (t) => {
+  const { handler } = await createTestContext(t);
+
+  const preflightResponse = await invoke({
+    handler,
+    method: "OPTIONS",
+    path: "/api/auth/register",
+    headers: {
+      origin: "https://agently-xi.vercel.app",
+      "access-control-request-method": "POST",
+      "access-control-request-headers": "content-type",
+    },
+  });
+
+  assert.equal(preflightResponse.status, 204);
+  assert.equal(preflightResponse.headers["access-control-allow-methods"], "GET,POST,PATCH,PUT,DELETE,OPTIONS");
+
+  const registerResponse = await invoke({
+    handler,
+    method: "POST",
+    path: "/api/auth/register",
+    headers: {
+      origin: "https://agently-xi.vercel.app",
+    },
+    body: {
+      name: "New Owner",
+      email: "new-owner@example.com",
+      password: "demo-password",
+      companyName: "Agently Test Co",
+    },
+  });
+
+  assert.equal(registerResponse.status, 201);
+  assert.ok(registerResponse.headers["access-control-allow-origin"]);
+  assert.ok(registerResponse.json.token);
+  assert.equal(registerResponse.json.user.email, "new-owner@example.com");
 });
 
 test("faq sync, messenger, call simulation, and csv export all respond", async (t) => {
